@@ -71,113 +71,37 @@ The server provides essential web crawling and search tools:
 
 ## Prerequisites
 
-- [Docker/Docker Desktop](https://www.docker.com/products/docker-desktop/) if running the MCP server as a container (recommended)
+- [Docker/Docker Desktop](https://www.docker.com/products/docker-desktop/)
 - [Python 3.12+](https://www.python.org/downloads/) if running the MCP server directly through uv
-- [Supabase](https://supabase.com/) (database for RAG)
 - [OpenAI API key](https://platform.openai.com/api-keys) (for generating embeddings)
 - [Neo4j](https://neo4j.com/) (optional, for knowledge graph functionality) - see [Knowledge Graph Setup](#knowledge-graph-setup) section
 
-## Installation
+## Installation & Setup
 
-### Using Docker (Recommended)
+The recommended way to run the server is with Docker Compose, which orchestrates the MCP server, PostgreSQL database, and Neo4j.
 
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/coleam00/mcp-crawl4ai-rag.git
-   cd mcp-crawl4ai-rag
-   ```
+1.  **Clone the repository:**
+    ```bash
+    git clone https://github.com/coleam00/mcp-crawl4ai-rag.git
+    cd mcp-crawl4ai-rag
+    ```
 
-2. Build the Docker image:
-   ```bash
-   docker build -t mcp/crawl4ai-rag --build-arg PORT=8051 .
-   ```
+2.  **Create and configure your `.env` file:**
+    Create a `.env` file in the project root by copying the example:
+    ```bash
+    cp .env.example .env
+    ```
+    Now, edit the `.env` file and fill in your `OPENAI_API_KEY` and your desired `NEO4J_PASSWORD`. The PostgreSQL variables are pre-configured for the Docker environment.
 
-3. Create a `.env` file based on the configuration section below
-
-### Using uv directly (no Docker)
-
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/coleam00/mcp-crawl4ai-rag.git
-   cd mcp-crawl4ai-rag
-   ```
-
-2. Install uv if you don't have it:
-   ```bash
-   pip install uv
-   ```
-
-3. Create and activate a virtual environment:
-   ```bash
-   uv venv
-   .venv\Scripts\activate
-   # on Mac/Linux: source .venv/bin/activate
-   ```
-
-4. Install dependencies:
-   ```bash
-   uv pip install -e .
-   crawl4ai-setup
-   ```
-
-5. Create a `.env` file based on the configuration section below
-
-## Database Setup
-
-Before running the server, you need to set up the database with the pgvector extension:
-
-1. Go to the SQL Editor in your Supabase dashboard (create a new project first if necessary)
-
-2. Create a new query and paste the contents of `crawled_pages.sql`
-
-3. Run the query to create the necessary tables and functions
-
-## Knowledge Graph Setup (Optional)
-
-To enable AI hallucination detection and repository analysis features, you need to set up Neo4j.
-
-Also, the knowledge graph implementation isn't fully compatible with Docker yet, so I would recommend right now running directly through uv if you want to use the hallucination detection within the MCP server!
-
-For installing Neo4j:
-
-### Local AI Package (Recommended)
-
-The easiest way to get Neo4j running locally is with the [Local AI Package](https://github.com/coleam00/local-ai-packaged) - a curated collection of local AI services including Neo4j:
-
-1. **Clone the Local AI Package**:
-   ```bash
-   git clone https://github.com/coleam00/local-ai-packaged.git
-   cd local-ai-packaged
-   ```
-
-2. **Start Neo4j**:
-   Follow the instructions in the Local AI Package repository to start Neo4j with Docker Compose
-
-3. **Default connection details**:
-   - URI: `bolt://localhost:7687`
-   - Username: `neo4j`
-   - Password: Check the Local AI Package documentation for the default password
-
-### Manual Neo4j Installation
-
-Alternatively, install Neo4j directly:
-
-1. **Install Neo4j Desktop**: Download from [neo4j.com/download](https://neo4j.com/download/)
-
-2. **Create a new database**:
-   - Open Neo4j Desktop
-   - Create a new project and database
-   - Set a password for the `neo4j` user
-   - Start the database
-
-3. **Note your connection details**:
-   - URI: `bolt://localhost:7687` (default)
-   - Username: `neo4j` (default)
-   - Password: Whatever you set during creation
+3.  **Run with Docker Compose:**
+    ```bash
+    docker-compose up --build
+    ```
+    This command will build the MCP server image, start all the services, and automatically set up the PostgreSQL database with the necessary tables and functions from `crawled_pages.sql`.
 
 ## Configuration
 
-Create a `.env` file in the project root with the following variables:
+Your `.env` file controls the server configuration.
 
 ```
 # MCP Server Configuration
@@ -198,9 +122,12 @@ USE_AGENTIC_RAG=false
 USE_RERANKING=false
 USE_KNOWLEDGE_GRAPH=false
 
-# Supabase Configuration
-SUPABASE_URL=your_supabase_project_url
-SUPABASE_SERVICE_KEY=your_supabase_service_key
+# PostgreSQL Configuration
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=postgres
+POSTGRES_DB=crawl4rag
 
 # Neo4j Configuration (required for knowledge graph functionality)
 NEO4J_URI=bolt://localhost:7687

@@ -1,15 +1,30 @@
 [project]
 name = "crawl4ai-mcp"
 version = "0.1.0"
-description = "MCP server for integrating web crawling and RAG into AI agents and AI coding assistants"
-readme = "README.md"
-requires-python = ">=3.12"
+description = "MCP server for Crawl4AI"
+authors = [
+    {name = "Prompt Engineer", email = "prompt-engineer@example.com"},
+]
 dependencies = [
     "crawl4ai==0.6.2",
     "mcp==1.7.1",
-    "supabase==2.15.1",
     "openai==1.71.0",
     "dotenv==0.9.9",
-    "sentence-transformers>=4.1.0",
+    "uvicorn==0.35.0",
+    "beautifulsoup4==4.13.4",
     "neo4j>=5.28.1",
+    "asyncpg>=0.29.0",
+    "sentence-transformers>=2.2.2",
 ]
+requires-python = ">=3.12"
+readme = "README.md"
+license = {text = "MIT"}
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[tool.pdm.scripts]
+dev = "uvicorn src.crawl4ai_mcp:app --host 0.0.0.0 --port 8080 --reload"
+start = "python src/crawl4ai_mcp.py"
+crawl4ai-setup = "python -m crawl4ai.setup"

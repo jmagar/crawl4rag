@@ -14,7 +14,7 @@ from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse, urldefrag
 from xml.etree import ElementTree
 from dotenv import load_dotenv
-from supabase import Client
+import asyncpg
 from pathlib import Path
 import requests
 import asyncio
@@ -31,15 +31,15 @@ knowledge_graphs_path = Path(__file__).resolve().parent.parent / 'knowledge_grap
 sys.path.append(str(knowledge_graphs_path))
 
 from utils import (
-    get_supabase_client, 
-    add_documents_to_supabase, 
+    get_db_pool, 
+    add_documents_to_db, 
     search_documents,
     extract_code_blocks,
     generate_code_example_summary,
-    add_code_examples_to_supabase,
+    add_code_examples_to_db,
     update_source_info,
     extract_source_summary,
-    search_code_examples
+    search_code_examples as search_code_examples_util
 )
 
 # Import knowledge graph modules
@@ -117,7 +117,7 @@ def validate_github_url(repo_url: str) -> Dict[str, Any]:
 class Crawl4AIContext:
     """Context for the Crawl4AI MCP server."""
     crawler: AsyncWebCrawler
-    supabase_client: Client
+    db_pool: asyncpg.Pool
     reranking_model: Optional[CrossEncoder] = None
     knowledge_validator: Optional[Any] = None  # KnowledgeGraphValidator when available
     repo_extractor: Optional[Any] = None       # DirectNeo4jExtractor when available
@@ -143,8 +143,8 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     crawler = AsyncWebCrawler(config=browser_config)
     await crawler.__aenter__()
     
-    # Initialize Supabase client
-    supabase_client = get_supabase_client()
+    # Initialize DB Pool
+    db_pool = await get_db_pool()
     
     # Initialize cross-encoder model for reranking if enabled
     reranking_model = None
@@ -193,26 +193,45 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     try:
         yield Crawl4AIContext(
             crawler=crawler,
-            supabase_client=supabase_client,
+            db_pool=db_pool,
             reranking_model=reranking_model,
             knowledge_validator=knowledge_validator,
             repo_extractor=repo_extractor
         )
     finally:
-        # Clean up all components
-        await crawler.__aexit__(None, None, None)
+        # Cleanup resources gracefully
+        print("Starting cleanup...")
+        
+        # Close crawler
+        try:
+            await crawler.__aexit__(None, None, None)
+            print("✓ Crawler closed")
+        except Exception as e:
+            print(f"Error closing crawler: {e}")
+        
+        # Close database pool
+        try:
+            await db_pool.close()
+            print("✓ Database pool closed")
+        except Exception as e:
+            print(f"Error closing database pool: {e}")
+        
+        # Close knowledge graph components
         if knowledge_validator:
             try:
                 await knowledge_validator.close()
                 print("✓ Knowledge graph validator closed")
             except Exception as e:
                 print(f"Error closing knowledge validator: {e}")
+                
         if repo_extractor:
             try:
                 await repo_extractor.close()
                 print("✓ Repository extractor closed")
             except Exception as e:
                 print(f"Error closing repository extractor: {e}")
+        
+        print("Cleanup completed")
 
 # Initialize FastMCP server
 mcp = FastMCP(
@@ -220,7 +239,7 @@ mcp = FastMCP(
     description="MCP server for RAG and web crawling with Crawl4AI",
     lifespan=crawl4ai_lifespan,
     host=os.getenv("HOST", "0.0.0.0"),
-    port=os.getenv("PORT", "8051")
+    port=int(os.getenv("PORT", "8051"))
 )
 
 def rerank_results(model: CrossEncoder, query: str, results: List[Dict[str, Any]], content_key: str = "content") -> List[Dict[str, Any]]:
@@ -296,12 +315,12 @@ def parse_sitemap(sitemap_url: str) -> List[str]:
         List of URLs found in the sitemap
     """
     resp = requests.get(sitemap_url)
-    urls = []
+    urls: List[str] = []
 
     if resp.status_code == 200:
         try:
             tree = ElementTree.fromstring(resp.content)
-            urls = [loc.text for loc in tree.findall('.//{*}loc')]
+            urls.extend([loc.text for loc in tree.findall('.//{*}loc') if loc.text])
         except Exception as e:
             print(f"Error parsing sitemap XML: {e}")
 
@@ -403,7 +422,7 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
     try:
         # Get the crawler from the context
         crawler = ctx.request_context.lifespan_context.crawler
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        db_pool = ctx.request_context.lifespan_context.db_pool
         
         # Configure the crawl
         run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
@@ -436,7 +455,15 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
                 meta["chunk_index"] = i
                 meta["url"] = url
                 meta["source"] = source_id
-                meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
+                task = asyncio.current_task()
+                if task:
+                    coro = task.get_coro()
+                    if coro:
+                        meta["crawl_time"] = coro.__name__
+                    else:
+                        meta["crawl_time"] = "unknown"
+                else:
+                    meta["crawl_time"] = "unknown"
                 metadatas.append(meta)
                 
                 # Accumulate word count
@@ -447,10 +474,10 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
             
             # Update source information FIRST (before inserting documents)
             source_summary = extract_source_summary(source_id, result.markdown[:5000])  # Use first 5000 chars for summary
-            update_source_info(supabase_client, source_id, source_summary, total_word_count)
+            await update_source_info(db_pool, source_id, source_summary, total_word_count)
             
-            # Add documentation chunks to Supabase (AFTER source exists)
-            add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document)
+            # Add documentation chunks to DB (AFTER source exists)
+            await add_documents_to_db(db_pool, urls, chunk_numbers, contents, metadatas, url_to_full_document)
             
             # Extract and process code examples only if enabled
             extract_code_examples = os.getenv("USE_AGENTIC_RAG", "false") == "true"
@@ -489,9 +516,9 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
                         }
                         code_metadatas.append(code_meta)
                     
-                    # Add code examples to Supabase
-                    add_code_examples_to_supabase(
-                        supabase_client, 
+                    # Add code examples to DB
+                    await add_code_examples_to_db(
+                        db_pool, 
                         code_urls, 
                         code_chunk_numbers, 
                         code_examples, 
@@ -550,7 +577,7 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
     try:
         # Get the crawler from the context
         crawler = ctx.request_context.lifespan_context.crawler
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        db_pool = ctx.request_context.lifespan_context.db_pool
         
         # Determine the crawl strategy
         crawl_results = []
@@ -620,7 +647,15 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 meta["url"] = source_url
                 meta["source"] = source_id
                 meta["crawl_type"] = crawl_type
-                meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
+                task = asyncio.current_task()
+                if task:
+                    coro = task.get_coro()
+                    if coro:
+                        meta["crawl_time"] = coro.__name__
+                    else:
+                        meta["crawl_time"] = "unknown"
+                else:
+                    meta["crawl_time"] = "unknown"
                 metadatas.append(meta)
                 
                 # Accumulate word count
@@ -640,14 +675,15 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         
         for (source_id, _), summary in zip(source_summary_args, source_summaries):
             word_count = source_word_counts.get(source_id, 0)
-            update_source_info(supabase_client, source_id, summary, word_count)
+            await update_source_info(db_pool, source_id, summary, word_count)
         
-        # Add documentation chunks to Supabase (AFTER sources exist)
+        # Add documentation chunks to DB (AFTER sources exist)
         batch_size = 20
-        add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
+        await add_documents_to_db(db_pool, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
         
         # Extract and process code examples from all documents only if enabled
         extract_code_examples_enabled = os.getenv("USE_AGENTIC_RAG", "false") == "true"
+        code_examples = []
         if extract_code_examples_enabled:
             all_code_blocks = []
             code_urls = []
@@ -692,10 +728,10 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                         }
                         code_metadatas.append(code_meta)
             
-            # Add all code examples to Supabase
+            # Add all code examples to DB
             if code_examples:
-                add_code_examples_to_supabase(
-                    supabase_client, 
+                await add_code_examples_to_db(
+                    db_pool, 
                     code_urls, 
                     code_chunk_numbers, 
                     code_examples, 
@@ -740,25 +776,23 @@ async def get_available_sources(ctx: Context) -> str:
         JSON string with the list of available sources and their details
     """
     try:
-        # Get the Supabase client from the context
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        # Get the DB pool from the context
+        db_pool = ctx.request_context.lifespan_context.db_pool
         
         # Query the sources table directly
-        result = supabase_client.from_('sources')\
-            .select('*')\
-            .order('source_id')\
-            .execute()
-        
+        async with db_pool.acquire() as connection:
+            result = await connection.fetch("SELECT * FROM sources ORDER BY source_id")
+
         # Format the sources with their details
         sources = []
-        if result.data:
-            for source in result.data:
+        if result:
+            for source in result:
                 sources.append({
                     "source_id": source.get("source_id"),
                     "summary": source.get("summary"),
-                    "total_words": source.get("total_words"),
-                    "created_at": source.get("created_at"),
-                    "updated_at": source.get("updated_at")
+                    "total_words": source.get("total_word_count") or 0,
+                    "created_at": str(source.get("created_at")),
+                    "updated_at": str(source.get("updated_at"))
                 })
         
         return json.dumps({
@@ -791,8 +825,8 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
         JSON string with the search results
     """
     try:
-        # Get the Supabase client from the context
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        # Get the DB pool from the context
+        db_pool = ctx.request_context.lifespan_context.db_pool
         
         # Check if hybrid search is enabled
         use_hybrid_search = os.getenv("USE_HYBRID_SEARCH", "false") == "true"
@@ -806,25 +840,26 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
             # Hybrid search: combine vector and keyword search
             
             # 1. Get vector search results (get more to account for filtering)
-            vector_results = search_documents(
-                client=supabase_client,
+            vector_results = await search_documents(
+                pool=db_pool,
                 query=query,
                 match_count=match_count * 2,  # Get double to have room for filtering
                 filter_metadata=filter_metadata
             )
             
             # 2. Get keyword search results using ILIKE
-            keyword_query = supabase_client.from_('crawled_pages')\
-                .select('id, url, chunk_number, content, metadata, source_id')\
-                .ilike('content', f'%{query}%')
+            async with db_pool.acquire() as connection:
+                keyword_query_str = "SELECT id, url, chunk_number, content, metadata, source_id FROM crawled_pages WHERE content ILIKE $1"
+                params: List[Any] = [f'%{query}%']
+                if source and source.strip():
+                    keyword_query_str += " AND source_id = $2"
+                    params.append(source)
+                keyword_query_str += " LIMIT $3"
+                params.append(match_count * 2)
+
+                keyword_response = await connection.fetch(keyword_query_str, *params)
             
-            # Apply source filter if provided
-            if source and source.strip():
-                keyword_query = keyword_query.eq('source_id', source)
-            
-            # Execute keyword search
-            keyword_response = keyword_query.limit(match_count * 2).execute()
-            keyword_results = keyword_response.data if keyword_response.data else []
+            keyword_results = [dict(row) for row in keyword_response] if keyword_response else []
             
             # 3. Combine results with preference for items appearing in both
             seen_ids = set()
@@ -869,8 +904,8 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
             
         else:
             # Standard vector search only
-            results = search_documents(
-                client=supabase_client,
+            results = await search_documents(
+                pool=db_pool,
                 query=query,
                 match_count=match_count,
                 filter_metadata=filter_metadata
@@ -940,8 +975,8 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
         }, indent=2)
     
     try:
-        # Get the Supabase client from the context
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        # Get the DB pool from the context
+        db_pool = ctx.request_context.lifespan_context.db_pool
         
         # Check if hybrid search is enabled
         use_hybrid_search = os.getenv("USE_HYBRID_SEARCH", "false") == "true"
@@ -954,29 +989,26 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
         if use_hybrid_search:
             # Hybrid search: combine vector and keyword search
             
-            # Import the search function from utils
-            from utils import search_code_examples as search_code_examples_impl
-            
             # 1. Get vector search results (get more to account for filtering)
-            vector_results = search_code_examples_impl(
-                client=supabase_client,
+            vector_results = await search_code_examples_util(
+                pool=db_pool,
                 query=query,
                 match_count=match_count * 2,  # Get double to have room for filtering
                 filter_metadata=filter_metadata
             )
             
             # 2. Get keyword search results using ILIKE on both content and summary
-            keyword_query = supabase_client.from_('code_examples')\
-                .select('id, url, chunk_number, content, summary, metadata, source_id')\
-                .or_(f'content.ilike.%{query}%,summary.ilike.%{query}%')
-            
-            # Apply source filter if provided
-            if source_id and source_id.strip():
-                keyword_query = keyword_query.eq('source_id', source_id)
-            
-            # Execute keyword search
-            keyword_response = keyword_query.limit(match_count * 2).execute()
-            keyword_results = keyword_response.data if keyword_response.data else []
+            async with db_pool.acquire() as connection:
+                keyword_query_str = "SELECT id, url, chunk_number, content, summary, metadata, source_id FROM code_examples WHERE (content ILIKE $1 OR summary ILIKE $1)"
+                params: List[Any] = [f'%{query}%']
+                if source_id and source_id.strip():
+                    keyword_query_str += " AND source_id = $2"
+                    params.append(source_id)
+                keyword_query_str += " LIMIT $3"
+                params.append(match_count * 2)
+                keyword_response = await connection.fetch(keyword_query_str, *params)
+
+            keyword_results = [dict(row) for row in keyword_response] if keyword_response else []
             
             # 3. Combine results with preference for items appearing in both
             seen_ids = set()
@@ -1022,10 +1054,8 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
             
         else:
             # Standard vector search only
-            from utils import search_code_examples as search_code_examples_impl
-            
-            results = search_code_examples_impl(
-                client=supabase_client,
+            results = await search_code_examples_util(
+                pool=db_pool,
                 query=query,
                 match_count=match_count,
                 filter_metadata=filter_metadata
@@ -1404,7 +1434,7 @@ async def _handle_explore_command(session, command: str, repo_name: str) -> str:
     }, indent=2)
 
 
-async def _handle_classes_command(session, command: str, repo_name: str = None) -> str:
+async def _handle_classes_command(session, command: str, repo_name: Optional[str] = None) -> str:
     """Handle 'classes [repo]' command - list classes"""
     limit = 20
     
@@ -1437,7 +1467,7 @@ async def _handle_classes_command(session, command: str, repo_name: str = None) 
         "command": command,
         "data": {
             "classes": classes,
-            "repository_filter": repo_name
+            "repository_filter": repo_name or "All"
         },
         "metadata": {
             "total_results": len(classes),
@@ -1523,8 +1553,10 @@ async def _handle_class_command(session, command: str, class_name: str) -> str:
     }, indent=2)
 
 
-async def _handle_method_command(session, command: str, method_name: str, class_name: str = None) -> str:
+async def _handle_method_command(session, command: str, method_name: str, class_name: Optional[str] = None) -> str:
     """Handle 'method <name> [class]' command - search for methods"""
+    limit = 20
+    
     if class_name:
         query = """
         MATCH (c:Class)-[:HAS_METHOD]->(m:Method)
@@ -1572,7 +1604,7 @@ async def _handle_method_command(session, command: str, method_name: str, class_
         "command": command,
         "data": {
             "methods": methods,
-            "class_filter": class_name
+            "class_filter": class_name or "All"
         },
         "metadata": {
             "total_results": len(methods),
@@ -1842,13 +1874,35 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
     return results_all
 
 async def main():
+    """Main entry point for the MCP server."""
     transport = os.getenv("TRANSPORT", "sse")
+    
     if transport == 'sse':
-        # Run the MCP server with sse transport
-        await mcp.run_sse_async()
+        try:
+            print(f"Starting MCP server on {os.getenv('HOST', '0.0.0.0')}:{os.getenv('PORT', '8051')}")
+            # Run the MCP server with sse transport
+            await mcp.run_sse_async()
+        except KeyboardInterrupt:
+            print("Server shutdown requested...")
+        except Exception as e:
+            print(f"Server error: {e}")
+            raise
     else:
-        # Run the MCP server with stdio transport
-        await mcp.run_stdio_async()
+        try:
+            print("Starting MCP server with stdio transport")
+            # Run the MCP server with stdio transport  
+            await mcp.run_stdio_async()
+        except KeyboardInterrupt:
+            print("Server shutdown requested...")
+        except Exception as e:
+            print(f"Server error: {e}")
+            raise
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Server stopped by user")
+    except Exception as e:
+        print(f"Failed to start server: {e}")
+        sys.exit(1)
