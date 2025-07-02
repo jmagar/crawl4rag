@@ -147,8 +147,8 @@ USE_KNOWLEDGE_GRAPH=false
 # Database Configuration (Docker secrets recommended for production)
 POSTGRES_HOST=localhost
 POSTGRES_PORT=5432
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=postgres
+POSTGRES_USER=CHANGEME
+POSTGRES_PASSWORD=CHANGEME
 POSTGRES_DB=crawl4rag
 
 # Database Performance Tuning
@@ -165,7 +165,7 @@ CODE_PROCESSING_BATCH_SIZE=5
 # Neo4j Configuration (required for knowledge graph functionality)
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
-NEO4J_PASSWORD=your_neo4j_password
+NEO4J_PASSWORD=CHANGEME
 
 # For production with Docker secrets, use these instead:
 # POSTGRES_USER_FILE=/run/secrets/postgres_user

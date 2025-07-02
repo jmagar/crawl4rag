@@ -29,7 +29,7 @@ services:
         condition: service_started
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:${PORT:-8051}/health"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${PORT:-8051}/health"]
       interval: 30s
       timeout: 10s
       retries: 3

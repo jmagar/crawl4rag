@@ -33,6 +33,7 @@ class DatabaseConfig:
     port: int
     min_connections: int = 2
     max_connections: int = 10
+    default_owner_id: str = "mcp_app_user"
     
     def __post_init__(self):
         """Validate configuration parameters."""
@@ -62,7 +63,8 @@ class DatabaseConfig:
             host=os.getenv("POSTGRES_HOST", "localhost"),
             port=int(os.getenv("POSTGRES_PORT", "5432")),
             min_connections=int(os.getenv("DB_MIN_CONNECTIONS", "2")),
-            max_connections=int(os.getenv("DB_MAX_CONNECTIONS", "10"))
+            max_connections=int(os.getenv("DB_MAX_CONNECTIONS", "10")),
+            default_owner_id=os.getenv("DEFAULT_OWNER_ID", "mcp_app_user")
         )
     
     @staticmethod
@@ -115,20 +117,7 @@ class OpenAIConfig:
             retry_delay=float(os.getenv("OPENAI_RETRY_DELAY", "1.0"))
         )
 
-@dataclass
-class SecurityConfig:
-    """Security configuration for database and API access."""
-    
-    neo4j_uri: str
-    neo4j_password: str
-    enable_rls: bool = True
-    
-    def __post_init__(self):
-        """Validate security configuration."""
-        if not self.neo4j_uri:
-            raise ValueError("Neo4j URI is required")
-        if not self.neo4j_password:
-            raise ValueError("Neo4j password is required")
+
 
 # Global configuration instances
 try:
@@ -438,7 +427,7 @@ async def add_documents_to_db(
                         source_id = parsed_url.netloc or parsed_url.path
                         
                         # Add owner_id for proper authorization
-                        owner_id = "mcp_app_user"  # Default owner for MCP operations
+                        owner_id = db_config.default_owner_id
                         
                         # Prepare data for insertion
                         data = (
@@ -706,7 +695,7 @@ async def add_code_examples_to_db(
                         idx = i + j
                         parsed_url = urlparse(urls[idx])
                         source_id = parsed_url.netloc or parsed_url.path
-                        owner_id = "mcp_app_user"  # Default owner for MCP operations
+                        owner_id = db_config.default_owner_id
                         
                         batch_data.append((
                             urls[idx],                       # url
@@ -747,7 +736,7 @@ async def update_source_info(pool: asyncpg.Pool, source_id: str, summary: str, w
     """
     try:
         async with pool.acquire() as connection:
-            owner_id = "mcp_app_user"  # Default owner for MCP operations
+            owner_id = db_config.default_owner_id
             
             await connection.execute("""
                 INSERT INTO sources (source_id, summary, total_word_count, owner_id, updated_at)

@@ -471,20 +471,7 @@ def extract_section_info(chunk: str) -> Dict[str, Any]:
         "word_count": len(chunk.split())
     }
 
-def process_code_example(args):
-    """
-    Process a single code example to generate its summary.
-    This function is designed to be used with concurrent.futures.
-    
-    Args:
-        args: Tuple containing (code, context_before, context_after)
-        
-    Returns:
-        The generated summary
-    """
-    code, context_before, context_after = args
-    # Note: This will need to be wrapped in asyncio.run() since the function is now async
-    return asyncio.run(generate_code_example_summary(code, context_before, context_after))
+
 
 @mcp.tool()
 async def crawl_single_page(ctx: Context, url: str) -> str:
@@ -836,14 +823,18 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 code_blocks = extract_code_blocks(md)
                 
                 if code_blocks:
-                    # Process code examples in parallel
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                        # Prepare arguments for parallel processing
-                        summary_args = [(block['code'], block['context_before'], block['context_after']) 
-                                        for block in code_blocks]
-                        
-                        # Generate summaries in parallel
-                        summaries = list(executor.map(process_code_example, summary_args))
+                    # Process code examples asynchronously
+                    summary_tasks = []
+                    for block in code_blocks:
+                        task = generate_code_example_summary(
+                            block['code'], 
+                            block['context_before'], 
+                            block['context_after']
+                        )
+                        summary_tasks.append(task)
+                    
+                    # Generate summaries in parallel
+                    summaries = await asyncio.gather(*summary_tasks, return_exceptions=True)
                     
                     # Prepare code example data
                     parsed_url = urlparse(source_url)
@@ -852,6 +843,10 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                     if len(code_blocks) != len(summaries):
                         raise ValueError("Mismatch between code blocks and summaries count")
                     for i, (block, summary) in enumerate(zip(code_blocks, summaries, strict=True)):
+                        # Handle exceptions in summary generation
+                        if isinstance(summary, Exception):
+                            logger.warning(f"Failed to generate summary for code block {i}: {summary}")
+                            summary = "Code example for demonstration purposes."
                         code_urls.append(source_url)
                         code_chunk_numbers.append(len(code_examples))  # Use global code example index
                         code_examples.append(block['code'])
