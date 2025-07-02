@@ -93,8 +93,8 @@ The recommended way to run the server is with Docker Compose, which orchestrates
     # Create secrets directory
     mkdir -p secrets
     
-    # Set your credentials (replace with your actual passwords)
-    echo "postgres" > secrets/postgres_user.txt
+    # Set your credentials (use strong passwords for production)
+    echo "your_postgres_username" > secrets/postgres_user.txt
     echo "your_secure_postgres_password" > secrets/postgres_password.txt
     echo "your_secure_neo4j_password" > secrets/neo4j_password.txt
     

@@ -10,7 +10,8 @@ drop table if exists sources;
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'mcp_app_user') THEN
-        CREATE ROLE mcp_app_user WITH LOGIN ENCRYPTED PASSWORD 'mcp_secure_password_change_me';
+        CREATE ROLE mcp_app_user WITH LOGIN;
+        -- Password should be set via secure deployment process or environment variable
     END IF;
 END
 $$;
@@ -58,7 +59,7 @@ CREATE INDEX idx_crawled_pages_source_content ON crawled_pages (source_id, owner
 CREATE INDEX idx_crawled_pages_url_chunk ON crawled_pages (url, chunk_number);
 CREATE INDEX idx_crawled_pages_owner ON crawled_pages (owner_id);
 
--- Create a function to search for documentation chunks with proper authorization
+-- Create a function to search for documentation chunks using RLS
 create or replace function match_crawled_pages (
   query_embedding vector(1536),
   match_count int default 10,
@@ -74,7 +75,7 @@ create or replace function match_crawled_pages (
   similarity float
 )
 language plpgsql
-security definer
+security invoker
 as $$
 #variable_conflict use_column
 begin
@@ -90,7 +91,6 @@ begin
   from crawled_pages
   where crawled_pages.metadata @> filter
     AND (source_filter IS NULL OR crawled_pages.source_id = source_filter)
-    AND (crawled_pages.owner_id = current_user OR current_user = 'mcp_app_user')
   order by crawled_pages.embedding <=> query_embedding
   limit match_count;
 end;
@@ -161,7 +161,7 @@ CREATE INDEX idx_code_examples_source_id ON code_examples (source_id);
 CREATE INDEX idx_code_examples_source_owner ON code_examples (source_id, owner_id);
 CREATE INDEX idx_code_examples_owner ON code_examples (owner_id);
 
--- Create a function to search for code examples with proper authorization
+-- Create a function to search for code examples using RLS
 create or replace function match_code_examples (
   query_embedding vector(1536),
   match_count int default 10,
@@ -178,7 +178,7 @@ create or replace function match_code_examples (
   similarity float
 )
 language plpgsql
-security definer
+security invoker
 as $$
 #variable_conflict use_column
 begin
@@ -195,7 +195,6 @@ begin
   from code_examples
   where code_examples.metadata @> filter
     AND (source_filter IS NULL OR code_examples.source_id = source_filter)
-    AND (code_examples.owner_id = current_user OR current_user = 'mcp_app_user')
   order by code_examples.embedding <=> query_embedding
   limit match_count;
 end;

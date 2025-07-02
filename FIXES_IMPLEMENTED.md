@@ -219,7 +219,7 @@ NEO4J_PASSWORD_FILE=/run/secrets/neo4j_password
 
 While no tests were found in the original codebase, the following test structure is now recommended:
 
-```
+```text
 tests/
 ├── unit/
 │   ├── test_utils.py              # Database and embedding functions

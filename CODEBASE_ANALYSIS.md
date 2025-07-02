@@ -246,7 +246,7 @@ CREATE INDEX idx_crawled_pages_url_chunk ON crawled_pages (url, chunk_number);
 4. **Security Tests:** Missing security vulnerability scanning
 
 ### Recommended Test Structure
-```
+```text
 tests/
 ├── unit/
 │   ├── test_utils.py

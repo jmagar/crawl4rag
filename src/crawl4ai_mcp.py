@@ -616,7 +616,7 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
                     batch_summaries = await asyncio.gather(*summary_tasks, return_exceptions=True)
                     
                     # Process results for this batch
-                    for j, (block, summary) in enumerate(zip(batch_blocks, batch_summaries)):
+                    for j, (block, summary) in enumerate(zip(batch_blocks, batch_summaries, strict=True)):
                         global_index = i + j
                         
                         # Handle exceptions in summary generation
@@ -808,7 +808,9 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             source_summary_args = [(source_id, content) for source_id, content in source_content_map.items()]
             source_summaries = list(executor.map(lambda args: extract_source_summary(args[0], args[1]), source_summary_args))
         
-        for (source_id, _), summary in zip(source_summary_args, source_summaries):
+        if len(source_summary_args) != len(source_summaries):
+            raise ValueError("Mismatch between source summary arguments and summaries count")
+        for (source_id, _), summary in zip(source_summary_args, source_summaries, strict=True):
             word_count = source_word_counts.get(source_id, 0)
             await update_source_info(db_pool, source_id, summary, word_count)
         
@@ -847,7 +849,9 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                     parsed_url = urlparse(source_url)
                     source_id = parsed_url.netloc or parsed_url.path
                     
-                    for i, (block, summary) in enumerate(zip(code_blocks, summaries)):
+                    if len(code_blocks) != len(summaries):
+                        raise ValueError("Mismatch between code blocks and summaries count")
+                    for i, (block, summary) in enumerate(zip(code_blocks, summaries, strict=True)):
                         code_urls.append(source_url)
                         code_chunk_numbers.append(len(code_examples))  # Use global code example index
                         code_examples.append(block['code'])

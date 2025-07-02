@@ -29,7 +29,7 @@ services:
         condition: service_started
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:${PORT:-8051}/health', timeout=5)"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:${PORT:-8051}/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -61,7 +61,7 @@ services:
     container_name: crawl4rag-neo4j
     restart: unless-stopped
     environment:
-      - NEO4J_AUTH=neo4j/$$(cat /run/secrets/neo4j_password)
+      - NEO4J_AUTH_FILE=/run/secrets/neo4j_password
       - NEO4J_PLUGINS=["apoc"]
       - NEO4J_dbms_security_procedures_unrestricted=apoc.*
       - NEO4J_dbms_security_procedures_allowlist=apoc.*

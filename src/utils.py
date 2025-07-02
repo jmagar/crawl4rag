@@ -1,5 +1,6 @@
 """
 Utility functions for the Crawl4AI MCP server.
+Includes database operations, embedding generation, and configuration management.
 """
 import os
 import concurrent.futures
@@ -9,12 +10,11 @@ import asyncpg
 from urllib.parse import urlparse
 import openai
 from openai import AsyncOpenAI, OpenAI
-import re
 import time
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 import asyncio
+from functools import lru_cache
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -31,8 +31,19 @@ class DatabaseConfig:
     database: str
     host: str
     port: int
-    min_connections: int = 5
-    max_connections: int = 20
+    min_connections: int = 2
+    max_connections: int = 10
+    
+    def __post_init__(self):
+        """Validate configuration parameters."""
+        if self.port <= 0:
+            raise ValueError("Port must be positive")
+        if self.min_connections <= 0:
+            raise ValueError("min_connections must be positive")
+        if self.max_connections < self.min_connections:
+            raise ValueError("max_connections must be >= min_connections")
+        if not all([self.host, self.database, self.user, self.password]):
+            raise ValueError("All database fields are required")
     
     @classmethod
     def from_env(cls) -> 'DatabaseConfig':
@@ -50,8 +61,8 @@ class DatabaseConfig:
             database=os.getenv("POSTGRES_DB", "crawl4rag"),
             host=os.getenv("POSTGRES_HOST", "localhost"),
             port=int(os.getenv("POSTGRES_PORT", "5432")),
-            min_connections=int(os.getenv("DB_MIN_CONNECTIONS", "5")),
-            max_connections=int(os.getenv("DB_MAX_CONNECTIONS", "20"))
+            min_connections=int(os.getenv("DB_MIN_CONNECTIONS", "2")),
+            max_connections=int(os.getenv("DB_MAX_CONNECTIONS", "10"))
         )
     
     @staticmethod
@@ -103,6 +114,21 @@ class OpenAIConfig:
             max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "3")),
             retry_delay=float(os.getenv("OPENAI_RETRY_DELAY", "1.0"))
         )
+
+@dataclass
+class SecurityConfig:
+    """Security configuration for database and API access."""
+    
+    neo4j_uri: str
+    neo4j_password: str
+    enable_rls: bool = True
+    
+    def __post_init__(self):
+        """Validate security configuration."""
+        if not self.neo4j_uri:
+            raise ValueError("Neo4j URI is required")
+        if not self.neo4j_password:
+            raise ValueError("Neo4j password is required")
 
 # Global configuration instances
 try:
@@ -221,7 +247,7 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
                     except Exception as individual_error:
                         logger.warning(f"Failed to create embedding for text {i}: {individual_error}")
                         # Raise error instead of using zero embeddings
-                        raise EmbeddingError(f"Failed to create embedding for text {i}: {individual_error}")
+                        raise EmbeddingError(f"Failed to create embedding for text {i}: {individual_error}") from individual_error
                 
                 logger.info(f"Successfully created {successful_count}/{len(texts)} embeddings individually")
                 return embeddings
@@ -246,7 +272,7 @@ def create_embedding(text: str) -> List[float]:
         return embeddings[0] if embeddings else []
     except Exception as e:
         logger.error(f"Error creating single embedding: {e}")
-        raise EmbeddingError(f"Failed to create embedding: {e}")
+        raise EmbeddingError(f"Failed to create embedding: {e}") from e
 
 async def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, bool]:
     """
@@ -345,8 +371,7 @@ async def add_documents_to_db(
     logger.info(f"Using contextual embeddings: {use_contextual_embeddings}")
     
     # Use a single transaction for the entire operation to prevent race conditions
-    async with pool.acquire() as connection:
-        async with connection.transaction():
+    async with pool.acquire() as connection, connection.transaction():
             try:
                 # Delete existing records for these URLs
                 if unique_urls:
@@ -655,8 +680,7 @@ async def add_code_examples_to_db(
     unique_urls = list(set(urls))
     
     # Use transaction for consistency
-    async with pool.acquire() as connection:
-        async with connection.transaction():
+    async with pool.acquire() as connection, connection.transaction():
             try:
                 # Delete existing code examples for these URLs
                 if unique_urls:
@@ -858,3 +882,71 @@ async def search_code_examples(
     except Exception as e:
         logger.error(f"Error searching code examples: {e}")
         return []
+
+@lru_cache(maxsize=128)
+def validate_url(url: str) -> bool:
+    """
+    Validate URL format with caching for performance.
+    
+    Args:
+        url: URL to validate
+        
+    Returns:
+        True if URL is valid
+    """
+    if not url or not isinstance(url, str):
+        return False
+    
+    url = url.strip()
+    if not url:
+        return False
+    
+    # Basic URL validation
+    return url.startswith(('http://', 'https://')) and len(url) > 10
+
+async def cleanup_old_data(days: int = 30) -> int:
+    """
+    Clean up old crawled data beyond specified days.
+    
+    Args:
+        days: Number of days to keep data for
+        
+    Returns:
+        Number of records deleted
+    """
+    if days <= 0:
+        raise ValueError("Days must be positive")
+    
+    pool = await get_db_pool()
+    
+    async with pool.acquire() as connection, connection.transaction():
+        # Delete old crawled pages
+        result1 = await connection.execute("""
+            DELETE FROM crawled_pages 
+            WHERE created_at < NOW() - INTERVAL '%s days'
+        """, days)
+        
+        # Delete old code examples  
+        result2 = await connection.execute("""
+            DELETE FROM code_examples 
+            WHERE created_at < NOW() - INTERVAL '%s days'
+        """, days)
+        
+        # Delete orphaned sources
+        result3 = await connection.execute("""
+            DELETE FROM sources 
+            WHERE source_id NOT IN (
+                SELECT DISTINCT source_id FROM crawled_pages
+                UNION
+                SELECT DISTINCT source_id FROM code_examples
+            )
+        """)
+        
+        deleted_count = (
+            int(result1.split()[-1]) + 
+            int(result2.split()[-1]) + 
+            int(result3.split()[-1])
+        )
+        
+        logging.info(f"Cleaned up {deleted_count} old records")
+        return deleted_count
