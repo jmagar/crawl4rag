@@ -8,122 +8,250 @@ import json
 import asyncpg
 from urllib.parse import urlparse
 import openai
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 import re
 import time
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+import asyncio
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# -----------------------------------------------------------------------------
+# Configuration validation and management
+# -----------------------------------------------------------------------------
+
+@dataclass
+class DatabaseConfig:
+    """Database configuration with validation"""
+    user: str
+    password: str
+    database: str
+    host: str
+    port: int
+    min_connections: int = 5
+    max_connections: int = 20
+    
+    @classmethod
+    def from_env(cls) -> 'DatabaseConfig':
+        """Create config from environment variables with validation"""
+        # Support both direct credentials and file-based secrets
+        user = cls._get_credential('POSTGRES_USER')
+        password = cls._get_credential('POSTGRES_PASSWORD')
+        
+        if not user or not password:
+            raise ValueError("PostgreSQL credentials not found. Set POSTGRES_USER/POSTGRES_PASSWORD or use Docker secrets.")
+        
+        return cls(
+            user=user,
+            password=password,
+            database=os.getenv("POSTGRES_DB", "crawl4rag"),
+            host=os.getenv("POSTGRES_HOST", "localhost"),
+            port=int(os.getenv("POSTGRES_PORT", "5432")),
+            min_connections=int(os.getenv("DB_MIN_CONNECTIONS", "5")),
+            max_connections=int(os.getenv("DB_MAX_CONNECTIONS", "20"))
+        )
+    
+    @staticmethod
+    def _get_credential(env_var: str) -> Optional[str]:
+        """Get credential from environment variable or file"""
+        # First try direct environment variable
+        value = os.getenv(env_var)
+        if value:
+            return value
+        
+        # Try file-based secret (Docker secrets)
+        file_var = f"{env_var}_FILE"
+        file_path = os.getenv(file_var)
+        if file_path and os.path.exists(file_path):
+            try:
+                with open(file_path, 'r') as f:
+                    return f.read().strip()
+            except Exception as e:
+                logger.error(f"Failed to read credential file {file_path}: {e}")
+        
+        return None
+
+@dataclass 
+class OpenAIConfig:
+    """OpenAI configuration with validation"""
+    api_key: str
+    embedding_url: str
+    embedding_model: str
+    contextual_model: str
+    max_retries: int = 3
+    retry_delay: float = 1.0
+    
+    @classmethod
+    def from_env(cls) -> 'OpenAIConfig':
+        """Create config from environment variables with validation"""
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY is required")
+        
+        embedding_url = os.getenv("EMBEDDING_URL", "https://api.openai.com/v1/")
+        if not embedding_url.endswith("/"):
+            embedding_url += "/"
+        
+        return cls(
+            api_key=api_key,
+            embedding_url=embedding_url,
+            embedding_model=os.getenv("EMBEDDING_MODEL", "text-embedding-bge-m3"),
+            contextual_model=os.getenv("CONTEXTUAL_MODEL", "gpt-4o-mini"),
+            max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "3")),
+            retry_delay=float(os.getenv("OPENAI_RETRY_DELAY", "1.0"))
+        )
+
+# Global configuration instances
+try:
+    db_config = DatabaseConfig.from_env()
+    openai_config = OpenAIConfig.from_env()
+except Exception as e:
+    logger.error(f"Configuration error: {e}")
+    raise
 
 # -----------------------------------------------------------------------------
 # OpenAI client configuration
 # -----------------------------------------------------------------------------
-# We separate the client used for embeddings (can point to any OpenAI-compatible
-# server such as LM Studio) from the default OpenAI client that talks to
-# api.openai.com for contextual embeddings.
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# Dedicated client for embeddings
+embedding_client = OpenAI(api_key=openai_config.api_key, base_url=openai_config.embedding_url)
 
-# Embedding endpoint & model
-EMBEDDING_URL = os.getenv("EMBEDDING_URL", "https://api.openai.com/v1/")
-if not EMBEDDING_URL.endswith("/"):
-    EMBEDDING_URL += "/"
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-bge-m3")
+# Async client for contextual embeddings
+async_openai_client = AsyncOpenAI(api_key=openai_config.api_key)
 
-# Contextual-embedding (chat) model – still uses OpenAI cloud by default
-CONTEXTUAL_MODEL = os.getenv("CONTEXTUAL_MODEL", "gpt-4o-mini")
+# Set default client for backwards compatibility
+openai.api_key = openai_config.api_key
 
-# Dedicated client for embeddings so we don't have to keep mutating global state
-embedding_client = OpenAI(api_key=OPENAI_API_KEY, base_url=EMBEDDING_URL)
+# Global connection pool (will be initialized once)
+_db_pool: Optional[asyncpg.Pool] = None
 
-# Leave the default openai client pointing at api.openai.com for chat completions
-openai.api_key = OPENAI_API_KEY
-
-async def get_db_pool():
+async def get_db_pool() -> asyncpg.Pool:
     """
-    Get an asyncpg connection pool.
+    Get or create an asyncpg connection pool with proper resource limits.
     """
-    return await asyncpg.create_pool(
-        user=os.getenv("POSTGRES_USER"),
-        password=os.getenv("POSTGRES_PASSWORD"),
-        database=os.getenv("POSTGRES_DB"),
-        host=os.getenv("POSTGRES_HOST"),
-        port=os.getenv("POSTGRES_PORT"),
-    )
+    global _db_pool
+    
+    if _db_pool is None or _db_pool.is_closed():
+        try:
+            logger.info(f"Creating database connection pool (min={db_config.min_connections}, max={db_config.max_connections})")
+            _db_pool = await asyncpg.create_pool(
+                user=db_config.user,
+                password=db_config.password,
+                database=db_config.database,
+                host=db_config.host,
+                port=db_config.port,
+                min_size=db_config.min_connections,
+                max_size=db_config.max_connections,
+                command_timeout=60,
+                server_settings={
+                    'application_name': 'crawl4ai_mcp_server',
+                    'jit': 'off'  # Disable JIT for better connection performance
+                }
+            )
+            logger.info("Database connection pool created successfully")
+        except Exception as e:
+            logger.error(f"Failed to create database pool: {e}")
+            raise
+    
+    return _db_pool
+
+async def close_db_pool():
+    """Close the database connection pool"""
+    global _db_pool
+    if _db_pool and not _db_pool.is_closed():
+        await _db_pool.close()
+        logger.info("Database connection pool closed")
+
+class EmbeddingError(Exception):
+    """Custom exception for embedding generation errors"""
+    pass
 
 def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     """
-    Create embeddings for multiple texts in a single API call.
+    Create embeddings for multiple texts in a single API call with proper error handling.
     
     Args:
         texts: List of texts to create embeddings for
         
     Returns:
         List of embeddings (each embedding is a list of floats)
+        
+    Raises:
+        EmbeddingError: If embedding generation fails completely
     """
     if not texts:
         return []
     
-    max_retries = 3
-    retry_delay = 1.0  # Start with 1 second delay
-    
-    for retry in range(max_retries):
+    for retry in range(openai_config.max_retries):
         try:
+            logger.debug(f"Creating embeddings for {len(texts)} texts (attempt {retry + 1})")
             response = embedding_client.embeddings.create(
-                model=EMBEDDING_MODEL,
+                model=openai_config.embedding_model,
                 input=texts
             )
-            return [item.embedding for item in response.data]
+            embeddings = [item.embedding for item in response.data]
+            logger.debug(f"Successfully created {len(embeddings)} embeddings")
+            return embeddings
+            
         except Exception as e:
-            if retry < max_retries - 1:
-                print(f"Error creating batch embeddings (attempt {retry + 1}/{max_retries}): {e}")
-                print(f"Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
+            if retry < openai_config.max_retries - 1:
+                wait_time = openai_config.retry_delay * (2 ** retry)  # Exponential backoff
+                logger.warning(f"Error creating batch embeddings (attempt {retry + 1}/{openai_config.max_retries}): {e}")
+                logger.info(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
             else:
-                print(f"Failed to create batch embeddings after {max_retries} attempts: {e}")
+                logger.error(f"Failed to create batch embeddings after {openai_config.max_retries} attempts: {e}")
+                
                 # Try creating embeddings one by one as fallback
-                print("Attempting to create embeddings individually...")
+                logger.info("Attempting to create embeddings individually...")
                 embeddings = []
                 successful_count = 0
                 
                 for i, text in enumerate(texts):
                     try:
                         individual_response = embedding_client.embeddings.create(
-                            model=EMBEDDING_MODEL,
+                            model=openai_config.embedding_model,
                             input=[text]
                         )
                         embeddings.append(individual_response.data[0].embedding)
                         successful_count += 1
                     except Exception as individual_error:
-                        print(f"Failed to create embedding for text {i}: {individual_error}")
-                        # Add zero embedding as fallback
-                        embeddings.append([0.0] * 1536)
+                        logger.warning(f"Failed to create embedding for text {i}: {individual_error}")
+                        # Raise error instead of using zero embeddings
+                        raise EmbeddingError(f"Failed to create embedding for text {i}: {individual_error}")
                 
-                print(f"Successfully created {successful_count}/{len(texts)} embeddings individually")
+                logger.info(f"Successfully created {successful_count}/{len(texts)} embeddings individually")
                 return embeddings
-    return []
+    
+    raise EmbeddingError("Failed to create embeddings after all retry attempts")
 
 def create_embedding(text: str) -> List[float]:
     """
-    Create an embedding for a single text using OpenAI's API.
+    Create an embedding for a single text using OpenAI's API with proper error handling.
     
     Args:
         text: Text to create an embedding for
         
     Returns:
         List of floats representing the embedding
+        
+    Raises:
+        EmbeddingError: If embedding generation fails
     """
-    model_choice = CONTEXTUAL_MODEL
-    
     try:
         embeddings = create_embeddings_batch([text])
-        return embeddings[0] if embeddings else [0.0] * 1536
+        return embeddings[0] if embeddings else []
     except Exception as e:
-        print(f"Error creating embedding: {e}")
-        # Return empty embedding if there's an error
-        return [0.0] * 1536
+        logger.error(f"Error creating single embedding: {e}")
+        raise EmbeddingError(f"Failed to create embedding: {e}")
 
-def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, bool]:
+async def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, bool]:
     """
     Generate contextual information for a chunk within a document to improve retrieval.
+    Uses async OpenAI client to avoid blocking.
     
     Args:
         full_document: The complete document text
@@ -134,8 +262,6 @@ def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, 
         - The contextual text that situates the chunk within the document
         - Boolean indicating if contextual embedding was performed
     """
-    model_choice = CONTEXTUAL_MODEL
-    
     try:
         # Create the prompt for generating contextual information
         prompt = f"""<document> 
@@ -147,9 +273,9 @@ Here is the chunk we want to situate within the whole document
 </chunk> 
 Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else."""
 
-        # Call the OpenAI API to generate contextual information
-        response = openai.chat.completions.create(
-            model=model_choice,
+        # Call the OpenAI API to generate contextual information using async client
+        response = await async_openai_client.chat.completions.create(
+            model=openai_config.contextual_model,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
                 {"role": "user", "content": prompt}
@@ -167,13 +293,12 @@ Please give a short succinct context to situate this chunk within the overall do
         return contextual_text, True
     
     except Exception as e:
-        print(f"Error generating contextual embedding: {e}. Using original chunk instead.")
+        logger.warning(f"Error generating contextual embedding: {e}. Using original chunk instead.")
         return chunk, False
 
-def process_chunk_with_context(args):
+async def process_chunk_with_context(args: Tuple[str, str, str]) -> Tuple[str, bool]:
     """
-    Process a single chunk with contextual embedding.
-    This function is designed to be used with concurrent.futures.
+    Process a single chunk with contextual embedding asynchronously.
     
     Args:
         args: Tuple containing (url, content, full_document)
@@ -184,7 +309,7 @@ def process_chunk_with_context(args):
         - Boolean indicating if contextual embedding was performed
     """
     url, content, full_document = args
-    return generate_contextual_embedding(full_document, content)
+    return await generate_contextual_embedding(full_document, content)
 
 async def add_documents_to_db(
     pool: asyncpg.Pool,
@@ -196,8 +321,8 @@ async def add_documents_to_db(
     batch_size: int = 20
 ) -> None:
     """
-    Add documents to the database table in batches.
-    Deletes existing records with the same URLs before inserting to prevent duplicates.
+    Add documents to the database table in batches with proper transaction handling.
+    Uses transactions to prevent race conditions and ensure data consistency.
     
     Args:
         pool: asyncpg connection pool
@@ -208,158 +333,168 @@ async def add_documents_to_db(
         url_to_full_document: Dictionary mapping URLs to their full document content
         batch_size: Size of each batch for insertion
     """
+    if not urls:
+        logger.warning("No URLs provided to add_documents_to_db")
+        return
+    
     # Get unique URLs to delete existing records
     unique_urls = list(set(urls))
     
-    # Delete existing records for these URLs in a single operation
-    try:
-        if unique_urls:
-            async with pool.acquire() as connection:
-                await connection.execute("DELETE FROM crawled_pages WHERE url = ANY($1)", unique_urls)
-    except Exception as e:
-        print(f"Batch delete failed: {e}. Trying one-by-one deletion as fallback.")
-        # Fallback: delete records one by one
-        async with pool.acquire() as connection:
-            for url in unique_urls:
-                try:
-                    await connection.execute("DELETE FROM crawled_pages WHERE url = $1", url)
-                except Exception as inner_e:
-                    print(f"Error deleting record for URL {url}: {inner_e}")
-                    # Continue with the next URL even if one fails
-    
-    # Check if MODEL_CHOICE is set for contextual embeddings
+    # Check if contextual embeddings are enabled
     use_contextual_embeddings = os.getenv("USE_CONTEXTUAL_EMBEDDINGS", "false") == "true"
-    print(f"\n\nUse contextual embeddings: {use_contextual_embeddings}\n\n")
+    logger.info(f"Using contextual embeddings: {use_contextual_embeddings}")
     
-    # Process in batches to avoid memory issues
-    for i in range(0, len(contents), batch_size):
-        batch_end = min(i + batch_size, len(contents))
-        
-        # Get batch slices
-        batch_urls = urls[i:batch_end]
-        batch_chunk_numbers = chunk_numbers[i:batch_end]
-        batch_contents = contents[i:batch_end]
-        batch_metadatas = metadatas[i:batch_end]
-        
-        # Apply contextual embedding to each chunk if MODEL_CHOICE is set
-        if use_contextual_embeddings:
-            # Prepare arguments for parallel processing
-            process_args = []
-            for j, content in enumerate(batch_contents):
-                url = batch_urls[j]
-                full_document = url_to_full_document.get(url, "")
-                process_args.append((url, content, full_document))
-            
-            # Process in parallel using ThreadPoolExecutor
-            contextual_contents = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                # Submit all tasks and collect results
-                future_to_idx = {executor.submit(process_chunk_with_context, arg): idx 
-                                for idx, arg in enumerate(process_args)}
-                
-                # Process results as they complete
-                for future in concurrent.futures.as_completed(future_to_idx):
-                    idx = future_to_idx[future]
-                    try:
-                        result, success = future.result()
-                        contextual_contents.append(result)
-                        if success:
-                            batch_metadatas[idx]["contextual_embedding"] = True
-                    except Exception as e:
-                        print(f"Error processing chunk {idx}: {e}")
-                        # Use original content as fallback
-                        contextual_contents.append(batch_contents[idx])
-            
-            # Sort results back into original order if needed
-            if len(contextual_contents) != len(batch_contents):
-                print(f"Warning: Expected {len(batch_contents)} results but got {len(contextual_contents)}")
-                # Use original contents as fallback
-                contextual_contents = batch_contents
-        else:
-            # If not using contextual embeddings, use original contents
-            contextual_contents = batch_contents
-        
-        # Create embeddings for the entire batch at once
-        batch_embeddings = create_embeddings_batch(contextual_contents)
-        
-        batch_data = []
-        for j in range(len(contextual_contents)):
-            # Extract metadata fields
-            chunk_size = len(contextual_contents[j])
-            
-            # Extract source_id from URL
-            parsed_url = urlparse(batch_urls[j])
-            source_id = parsed_url.netloc or parsed_url.path
-            
-            # Prepare data for insertion
-            data = {
-                "url": batch_urls[j],
-                "chunk_number": batch_chunk_numbers[j],
-                "content": contextual_contents[j],  # Store original content
-                "metadata": json.dumps({
-                    "chunk_size": chunk_size,
-                    **batch_metadatas[j]
-                }),
-                "source_id": source_id,  # Add source_id field
-                "embedding": str(batch_embeddings[j])  # Use embedding from contextual content
-            }
-            
-            batch_data.append(data)
-        
-        # Insert batch into database with retry logic
-        max_retries = 3
-        retry_delay = 1.0  # Start with 1 second delay
-        
-        for retry in range(max_retries):
+    # Use a single transaction for the entire operation to prevent race conditions
+    async with pool.acquire() as connection:
+        async with connection.transaction():
             try:
-                async with pool.acquire() as connection:
-                    # Prepare the insert statement
-                    # Convert dict to columns and values for the query
-                    columns = batch_data[0].keys()
-                    # The `on_conflict` part is removed because we are deleting first
-                    query = f"""
-                        INSERT INTO crawled_pages ({', '.join(columns)})
-                        VALUES ({', '.join([f'${i+1}' for i in range(len(columns))])})
+                # Delete existing records for these URLs
+                if unique_urls:
+                    await connection.execute("DELETE FROM crawled_pages WHERE url = ANY($1)", unique_urls)
+                    logger.info(f"Deleted existing records for {len(unique_urls)} URLs")
+                
+                # Process in batches to avoid memory issues
+                total_processed = 0
+                for i in range(0, len(contents), batch_size):
+                    batch_end = min(i + batch_size, len(contents))
+                    
+                    # Get batch slices
+                    batch_urls = urls[i:batch_end]
+                    batch_chunk_numbers = chunk_numbers[i:batch_end]
+                    batch_contents = contents[i:batch_end]
+                    batch_metadatas = metadatas[i:batch_end].copy()  # Make a copy to avoid modifying original
+                    
+                    # Apply contextual embedding to each chunk if enabled
+                    if use_contextual_embeddings:
+                        logger.debug(f"Processing contextual embeddings for batch {i//batch_size + 1}")
+                        
+                        # Process contextual embeddings asynchronously
+                        contextual_tasks = []
+                        for j, content in enumerate(batch_contents):
+                            url = batch_urls[j]
+                            full_document = url_to_full_document.get(url, "")
+                            task = process_chunk_with_context((url, content, full_document))
+                            contextual_tasks.append(task)
+                        
+                        # Wait for all contextual embeddings to complete
+                        contextual_results = await asyncio.gather(*contextual_tasks, return_exceptions=True)
+                        
+                        # Process results
+                        contextual_contents = []
+                        for j, result in enumerate(contextual_results):
+                            if isinstance(result, Exception):
+                                logger.warning(f"Error processing contextual embedding for chunk {j}: {result}")
+                                contextual_contents.append(batch_contents[j])
+                            else:
+                                contextual_text, success = result
+                                contextual_contents.append(contextual_text)
+                                if success:
+                                    batch_metadatas[j]["contextual_embedding"] = True
+                    else:
+                        # If not using contextual embeddings, use original contents
+                        contextual_contents = batch_contents
+                    
+                    # Create embeddings for the entire batch at once
+                    try:
+                        batch_embeddings = create_embeddings_batch(contextual_contents)
+                        logger.debug(f"Created {len(batch_embeddings)} embeddings for batch")
+                    except EmbeddingError as e:
+                        logger.error(f"Failed to create embeddings for batch: {e}")
+                        raise
+                    
+                    # Prepare batch data for insertion
+                    batch_data = []
+                    for j in range(len(contextual_contents)):
+                        # Extract metadata fields
+                        chunk_size = len(contextual_contents[j])
+                        
+                        # Extract source_id from URL
+                        parsed_url = urlparse(batch_urls[j])
+                        source_id = parsed_url.netloc or parsed_url.path
+                        
+                        # Add owner_id for proper authorization
+                        owner_id = "mcp_app_user"  # Default owner for MCP operations
+                        
+                        # Prepare data for insertion
+                        data = (
+                            batch_urls[j],                    # url
+                            batch_chunk_numbers[j],          # chunk_number
+                            batch_contents[j],               # content (store original, not contextual)
+                            json.dumps({                     # metadata
+                                "chunk_size": chunk_size,
+                                **batch_metadatas[j]
+                            }),
+                            source_id,                       # source_id
+                            owner_id,                        # owner_id
+                            str(batch_embeddings[j])         # embedding (from contextual content)
+                        )
+                        
+                        batch_data.append(data)
+                    
+                    # Insert batch into database
+                    query = """
+                        INSERT INTO crawled_pages (url, chunk_number, content, metadata, source_id, owner_id, embedding)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
                     """
                     
-                    await connection.executemany(query, [list(d.values()) for d in batch_data])
-
-                break # Success
+                    await connection.executemany(query, batch_data)
+                    total_processed += len(batch_data)
+                    logger.debug(f"Inserted batch of {len(batch_data)} records")
+                
+                logger.info(f"Successfully inserted {total_processed} documents into database")
+                
             except Exception as e:
-                if retry < max_retries - 1:
-                    print(f"Error inserting batch into DB (attempt {retry + 1}/{max_retries}): {e}")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                else:
-                    # Final attempt failed
-                    print(f"Failed to insert batch after {max_retries} attempts: {e}")
+                logger.error(f"Error during document insertion: {e}")
+                raise
 
 async def search_documents(
     pool: asyncpg.Pool, 
     query: str, 
     match_count: int = 10, 
-    filter_metadata: Optional[Dict[str, Any]] = None
+    filter_metadata: Optional[Dict[str, Any]] = None,
+    source_filter: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
-    Search for documents in the database using vector similarity.
+    Search for documents in the database using vector similarity with proper error handling.
+    
+    Args:
+        pool: Database connection pool
+        query: Search query text
+        match_count: Maximum number of results to return
+        filter_metadata: Optional metadata filter
+        source_filter: Optional source ID filter
+        
+    Returns:
+        List of matching documents
+        
+    Raises:
+        EmbeddingError: If query embedding generation fails
     """
-    query_embedding = create_embedding(query)
+    try:
+        query_embedding = create_embedding(query)
+    except EmbeddingError as e:
+        logger.error(f"Failed to create query embedding: {e}")
+        raise
     
     try:
         async with pool.acquire() as connection:
             if filter_metadata:
                 result = await connection.fetch(
-                    'SELECT * FROM match_crawled_pages($1, $2, $3)',
-                    str(query_embedding), match_count, json.dumps(filter_metadata)
+                    'SELECT * FROM match_crawled_pages($1, $2, $3, $4)',
+                    str(query_embedding), match_count, json.dumps(filter_metadata), source_filter
                 )
             else:
                 result = await connection.fetch(
-                    'SELECT * FROM match_crawled_pages($1, $2)',
-                    str(query_embedding), match_count
+                    'SELECT * FROM match_crawled_pages($1, $2, $3, $4)',
+                    str(query_embedding), match_count, json.dumps({}), source_filter
                 )
-        return [dict(row) for row in result]
+        
+        documents = [dict(row) for row in result]
+        logger.debug(f"Found {len(documents)} matching documents")
+        return documents
+        
     except Exception as e:
-        print(f"Error searching documents: {e}")
+        logger.error(f"Error searching documents: {e}")
         return []
 
 
@@ -445,9 +580,10 @@ def extract_code_blocks(markdown_content: str, min_length: int = 1000) -> List[D
     return code_blocks
 
 
-def generate_code_example_summary(code: str, context_before: str, context_after: str) -> str:
+async def generate_code_example_summary(code: str, context_before: str, context_after: str) -> str:
     """
     Generate a summary for a code example using its surrounding context.
+    Now uses async OpenAI client for better performance.
     
     Args:
         code: The code example
@@ -457,8 +593,6 @@ def generate_code_example_summary(code: str, context_before: str, context_after:
     Returns:
         A summary of what the code example demonstrates
     """
-    model_choice = CONTEXTUAL_MODEL
-    
     # Create the prompt
     prompt = f"""<context_before>
 {context_before[-500:] if len(context_before) > 500 else context_before}
@@ -476,8 +610,8 @@ Based on the code example and its surrounding context, provide a concise summary
 """
     
     try:
-        response = openai.chat.completions.create(
-            model=model_choice,
+        response = await async_openai_client.chat.completions.create(
+            model=openai_config.contextual_model,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that provides concise code example summaries."},
                 {"role": "user", "content": prompt}
@@ -489,7 +623,7 @@ Based on the code example and its surrounding context, provide a concise summary
         return response.choices[0].message.content.strip() if response.choices[0].message.content else "Code example for demonstration purposes."
     
     except Exception as e:
-        print(f"Error generating code example summary: {e}")
+        logger.warning(f"Error generating code example summary: {e}")
         return "Code example for demonstration purposes."
 
 
@@ -501,89 +635,115 @@ async def add_code_examples_to_db(
     summaries: List[str],
     metadatas: List[Dict[str, Any]],
     batch_size: int = 20
-):
+) -> None:
     """
-    Add code examples to the code_examples table in batches.
+    Add code examples to the code_examples table in batches with proper transaction handling.
+    
+    Args:
+        pool: Database connection pool
+        urls: List of URLs
+        chunk_numbers: List of chunk numbers
+        code_examples: List of code examples
+        summaries: List of summaries for each code example
+        metadatas: List of metadata dictionaries
+        batch_size: Size of each batch for processing
     """
     if not urls:
+        logger.warning("No URLs provided to add_code_examples_to_db")
         return
         
     unique_urls = list(set(urls))
-    try:
-        async with pool.acquire() as connection:
-            await connection.execute("DELETE FROM code_examples WHERE url = ANY($1)", unique_urls)
-    except Exception as e:
-        print(f"Error deleting existing code examples: {e}")
-
-    # Process in batches
-    total_items = len(urls)
-    for i in range(0, total_items, batch_size):
-        batch_end = min(i + batch_size, total_items)
-        batch_texts = [f"{code_examples[j]}\n\nSummary: {summaries[j]}" for j in range(i, batch_end)]
-        
-        embeddings = create_embeddings_batch(batch_texts)
-        
-        batch_data = []
-        for j, embedding in enumerate(embeddings):
-            idx = i + j
-            parsed_url = urlparse(urls[idx])
-            source_id = parsed_url.netloc or parsed_url.path
-            
-            batch_data.append({
-                'url': urls[idx],
-                'chunk_number': chunk_numbers[idx],
-                'content': code_examples[idx],
-                'summary': summaries[idx],
-                'metadata': json.dumps(metadatas[idx]),
-                'source_id': source_id,
-                'embedding': str(embedding)
-            })
-        
-        max_retries = 3
-        retry_delay = 1.0
-        
-        for retry in range(max_retries):
+    
+    # Use transaction for consistency
+    async with pool.acquire() as connection:
+        async with connection.transaction():
             try:
-                async with pool.acquire() as connection:
-                    columns = batch_data[0].keys()
-                    query = f"""
-                        INSERT INTO code_examples ({', '.join(columns)})
-                        VALUES ({', '.join([f'${k+1}' for k in range(len(columns))])})
-                    """
-                    # asyncpg's executemany is what we want here
-                    await connection.executemany(query, [list(d.values()) for d in batch_data])
-                break
-            except Exception as e:
-                if retry < max_retries - 1:
-                    print(f"Error inserting batch into DB (attempt {retry + 1}/{max_retries}): {e}")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2
-                else:
-                    print(f"Failed to insert batch after {max_retries} attempts: {e}")
+                # Delete existing code examples for these URLs
+                if unique_urls:
+                    await connection.execute("DELETE FROM code_examples WHERE url = ANY($1)", unique_urls)
+                    logger.info(f"Deleted existing code examples for {len(unique_urls)} URLs")
 
-async def update_source_info(pool: asyncpg.Pool, source_id: str, summary: str, word_count: int):
+                # Process in batches
+                total_items = len(urls)
+                total_processed = 0
+                
+                for i in range(0, total_items, batch_size):
+                    batch_end = min(i + batch_size, total_items)
+                    batch_texts = [f"{code_examples[j]}\n\nSummary: {summaries[j]}" for j in range(i, batch_end)]
+                    
+                    try:
+                        embeddings = create_embeddings_batch(batch_texts)
+                    except EmbeddingError as e:
+                        logger.error(f"Failed to create embeddings for code examples batch: {e}")
+                        raise
+                    
+                    batch_data = []
+                    for j, embedding in enumerate(embeddings):
+                        idx = i + j
+                        parsed_url = urlparse(urls[idx])
+                        source_id = parsed_url.netloc or parsed_url.path
+                        owner_id = "mcp_app_user"  # Default owner for MCP operations
+                        
+                        batch_data.append((
+                            urls[idx],                       # url
+                            chunk_numbers[idx],             # chunk_number
+                            code_examples[idx],             # content
+                            summaries[idx],                 # summary
+                            json.dumps(metadatas[idx]),     # metadata
+                            source_id,                      # source_id
+                            owner_id,                       # owner_id
+                            str(embedding)                  # embedding
+                        ))
+                    
+                    # Insert batch into database
+                    query = """
+                        INSERT INTO code_examples (url, chunk_number, content, summary, metadata, source_id, owner_id, embedding)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    """
+                    
+                    await connection.executemany(query, batch_data)
+                    total_processed += len(batch_data)
+                    logger.debug(f"Inserted batch of {len(batch_data)} code examples")
+                
+                logger.info(f"Successfully inserted {total_processed} code examples into database")
+                
+            except Exception as e:
+                logger.error(f"Error during code examples insertion: {e}")
+                raise
+
+async def update_source_info(pool: asyncpg.Pool, source_id: str, summary: str, word_count: int) -> None:
     """
-    Update or insert source information in the sources table.
+    Update or insert source information in the sources table with proper error handling.
+    
+    Args:
+        pool: Database connection pool
+        source_id: The source identifier
+        summary: Summary of the source content
+        word_count: Total word count for the source
     """
     try:
         async with pool.acquire() as connection:
+            owner_id = "mcp_app_user"  # Default owner for MCP operations
+            
             await connection.execute("""
-                INSERT INTO sources (source_id, summary, total_word_count, updated_at)
-                VALUES ($1, $2, $3, NOW())
+                INSERT INTO sources (source_id, summary, total_word_count, owner_id, updated_at)
+                VALUES ($1, $2, $3, $4, NOW())
                 ON CONFLICT (source_id) DO UPDATE SET
                     summary = EXCLUDED.summary,
                     total_word_count = EXCLUDED.total_word_count,
                     updated_at = NOW();
-            """, source_id, summary, word_count)
-            print(f"Upserted source: {source_id}")
+            """, source_id, summary, word_count, owner_id)
+            
+            logger.info(f"Updated source info for: {source_id}")
+            
     except Exception as e:
-        print(f"Error updating source {source_id}: {e}")
+        logger.error(f"Error updating source {source_id}: {e}")
+        raise
 
-def extract_source_summary(source_id: str, content: str, max_length: int = 500) -> str:
+async def extract_source_summary(source_id: str, content: str, max_length: int = 500) -> str:
     """
     Extract a summary for a source from its content using an LLM.
-    
-    This function uses the OpenAI API to generate a concise summary of the source content.
+    Now uses async OpenAI client for better performance.
     
     Args:
         source_id: The source ID (domain)
@@ -599,9 +759,6 @@ def extract_source_summary(source_id: str, content: str, max_length: int = 500) 
     if not content or len(content.strip()) == 0:
         return default_summary
     
-    # Get the model choice from environment variables
-    model_choice = CONTEXTUAL_MODEL
-    
     # Limit content length to avoid token limits
     truncated_content = content[:25000] if len(content) > 25000 else content
     
@@ -615,8 +772,8 @@ The above content is from the documentation for '{source_id}'. Please provide a 
     
     try:
         # Call the OpenAI API to generate the summary
-        response = openai.chat.completions.create(
-            model=model_choice,
+        response = await async_openai_client.chat.completions.create(
+            model=openai_config.contextual_model,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that provides concise library/tool/framework summaries."},
                 {"role": "user", "content": prompt}
@@ -635,7 +792,7 @@ The above content is from the documentation for '{source_id}'. Please provide a 
         return summary
     
     except Exception as e:
-        print(f"Error generating summary with LLM for {source_id}: {e}. Using default summary.")
+        logger.warning(f"Error generating summary with LLM for {source_id}: {e}. Using default summary.")
         return default_summary
 
 
@@ -647,34 +804,57 @@ async def search_code_examples(
     source_id: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
-    Search for code examples in the database using vector similarity.
+    Search for code examples in the database using vector similarity with proper error handling.
+    
+    Args:
+        pool: Database connection pool
+        query: Search query text
+        match_count: Maximum number of results to return
+        filter_metadata: Optional metadata filter
+        source_id: Optional source ID filter
+        
+    Returns:
+        List of matching code examples
+        
+    Raises:
+        EmbeddingError: If query embedding generation fails
     """
-    enhanced_query = f"Code example for {query}\\n\\nSummary: Example code showing {query}"
-    query_embedding = create_embedding(enhanced_query)
+    enhanced_query = f"Code example for {query}\n\nSummary: Example code showing {query}"
+    
+    try:
+        query_embedding = create_embedding(enhanced_query)
+    except EmbeddingError as e:
+        logger.error(f"Failed to create query embedding for code search: {e}")
+        raise
     
     try:
         async with pool.acquire() as connection:
-            if source_id and filter_metadata:
+            # Construct query based on available filters
+            if filter_metadata and source_id:
                 result = await connection.fetch(
                     'SELECT * FROM match_code_examples($1, $2, $3, $4)',
                     str(query_embedding), match_count, json.dumps(filter_metadata), source_id
                 )
             elif source_id:
-                 result = await connection.fetch(
-                    'SELECT * FROM match_code_examples($1, $2, $3)',
-                    str(query_embedding), match_count, source_id
+                result = await connection.fetch(
+                    'SELECT * FROM match_code_examples($1, $2, $3, $4)',
+                    str(query_embedding), match_count, json.dumps({}), source_id
                 )
             elif filter_metadata:
                 result = await connection.fetch(
-                    'SELECT * FROM match_code_examples($1, $2, $3)',
-                    str(query_embedding), match_count, json.dumps(filter_metadata)
+                    'SELECT * FROM match_code_examples($1, $2, $3, $4)',
+                    str(query_embedding), match_count, json.dumps(filter_metadata), None
                 )
             else:
                 result = await connection.fetch(
-                    'SELECT * FROM match_code_examples($1, $2)',
-                    str(query_embedding), match_count
+                    'SELECT * FROM match_code_examples($1, $2, $3, $4)',
+                    str(query_embedding), match_count, json.dumps({}), None
                 )
-        return [dict(row) for row in result]
+        
+        code_examples = [dict(row) for row in result]
+        logger.debug(f"Found {len(code_examples)} matching code examples")
+        return code_examples
+        
     except Exception as e:
-        print(f"Error searching code examples: {e}")
+        logger.error(f"Error searching code examples: {e}")
         return []

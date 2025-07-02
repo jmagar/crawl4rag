@@ -23,6 +23,8 @@ import os
 import re
 import concurrent.futures
 import sys
+import logging
+from functools import lru_cache
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
 
@@ -32,6 +34,7 @@ sys.path.append(str(knowledge_graphs_path))
 
 from utils import (
     get_db_pool, 
+    close_db_pool,
     add_documents_to_db, 
     search_documents,
     extract_code_blocks,
@@ -39,7 +42,8 @@ from utils import (
     add_code_examples_to_db,
     update_source_info,
     extract_source_summary,
-    search_code_examples as search_code_examples_util
+    search_code_examples as search_code_examples_util,
+    EmbeddingError
 )
 
 # Import knowledge graph modules
@@ -48,6 +52,14 @@ from parse_repo_into_neo4j import DirectNeo4jExtractor
 from ai_script_analyzer import AIScriptAnalyzer
 from hallucination_reporter import HallucinationReporter
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 # Load environment variables from the project root .env file
 project_root = Path(__file__).resolve().parent.parent
 dotenv_path = project_root / '.env'
@@ -55,14 +67,41 @@ dotenv_path = project_root / '.env'
 # Force override of existing environment variables
 load_dotenv(dotenv_path, override=True)
 
-# Helper functions for Neo4j validation and error handling
+# Configuration validation
+def get_neo4j_credentials() -> Dict[str, Optional[str]]:
+    """Get Neo4j credentials from environment variables or files."""
+    credentials = {}
+    
+    # Get URI
+    credentials['uri'] = os.getenv("NEO4J_URI")
+    if not credentials['uri']:
+        logger.warning("NEO4J_URI not found in environment variables")
+    
+    # Get user
+    credentials['user'] = os.getenv("NEO4J_USER")
+    if not credentials['user']:
+        logger.warning("NEO4J_USER not found in environment variables")
+    
+    # Get password - try file first, then environment
+    password_file = os.getenv("NEO4J_PASSWORD_FILE")
+    if password_file and os.path.exists(password_file):
+        try:
+            with open(password_file, 'r') as f:
+                credentials['password'] = f.read().strip()
+        except Exception as e:
+            logger.error(f"Failed to read Neo4j password file {password_file}: {e}")
+    else:
+        credentials['password'] = os.getenv("NEO4J_PASSWORD")
+    
+    if not credentials['password']:
+        logger.warning("NEO4J_PASSWORD not found in environment variables or file")
+    
+    return credentials
+
 def validate_neo4j_connection() -> bool:
     """Check if Neo4j environment variables are configured."""
-    return all([
-        os.getenv("NEO4J_URI"),
-        os.getenv("NEO4J_USER"),
-        os.getenv("NEO4J_PASSWORD")
-    ])
+    creds = get_neo4j_credentials()
+    return all(creds.values())
 
 def format_neo4j_error(error: Exception) -> str:
     """Format Neo4j connection errors for user-friendly messages."""
@@ -125,72 +164,87 @@ class Crawl4AIContext:
 @asynccontextmanager
 async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     """
-    Manages the Crawl4AI client lifecycle.
+    Manages the Crawl4AI client lifecycle with proper error handling and resource management.
     
     Args:
         server: The FastMCP server instance
         
     Yields:
-        Crawl4AIContext: The context containing the Crawl4AI crawler and Supabase client
+        Crawl4AIContext: The context containing the Crawl4AI crawler and database pool
     """
+    logger.info("Starting Crawl4AI MCP server initialization...")
+    
     # Create browser configuration
     browser_config = BrowserConfig(
         headless=True,
         verbose=False
     )
     
-    # Initialize the crawler
-    crawler = AsyncWebCrawler(config=browser_config)
-    await crawler.__aenter__()
-    
-    # Initialize DB Pool
-    db_pool = await get_db_pool()
-    
-    # Initialize cross-encoder model for reranking if enabled
+    # Initialize components
+    crawler = None
+    db_pool = None
     reranking_model = None
-    if os.getenv("USE_RERANKING", "false") == "true":
-        try:
-            reranking_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-        except Exception as e:
-            print(f"Failed to load reranking model: {e}")
-            reranking_model = None
-    
-    # Initialize Neo4j components if configured and enabled
     knowledge_validator = None
     repo_extractor = None
     
-    # Check if knowledge graph functionality is enabled
-    knowledge_graph_enabled = os.getenv("USE_KNOWLEDGE_GRAPH", "false") == "true"
-    
-    if knowledge_graph_enabled:
-        neo4j_uri = os.getenv("NEO4J_URI")
-        neo4j_user = os.getenv("NEO4J_USER")
-        neo4j_password = os.getenv("NEO4J_PASSWORD")
-        
-        if neo4j_uri and neo4j_user and neo4j_password:
-            try:
-                print("Initializing knowledge graph components...")
-                
-                # Initialize knowledge graph validator
-                knowledge_validator = KnowledgeGraphValidator(neo4j_uri, neo4j_user, neo4j_password)
-                await knowledge_validator.initialize()
-                print("✓ Knowledge graph validator initialized")
-                
-                # Initialize repository extractor
-                repo_extractor = DirectNeo4jExtractor(neo4j_uri, neo4j_user, neo4j_password)
-                await repo_extractor.initialize()
-                print("✓ Repository extractor initialized")
-                
-            except Exception as e:
-                print(f"Failed to initialize Neo4j components: {format_neo4j_error(e)}")
-                knowledge_validator = None
-                repo_extractor = None
-        else:
-            print("Neo4j credentials not configured - knowledge graph tools will be unavailable")
-    else:
-        print("Knowledge graph functionality disabled - set USE_KNOWLEDGE_GRAPH=true to enable")
-    
     try:
+        # Initialize the crawler
+        logger.info("Initializing web crawler...")
+        crawler = AsyncWebCrawler(config=browser_config)
+        await crawler.__aenter__()
+        logger.info("✓ Web crawler initialized")
+        
+        # Initialize DB Pool
+        logger.info("Initializing database connection pool...")
+        db_pool = await get_db_pool()
+        logger.info("✓ Database connection pool initialized")
+        
+        # Initialize cross-encoder model for reranking if enabled
+        if os.getenv("USE_RERANKING", "false") == "true":
+            try:
+                logger.info("Loading reranking model...")
+                reranking_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+                logger.info("✓ Reranking model loaded")
+            except Exception as e:
+                logger.error(f"Failed to load reranking model: {e}")
+                reranking_model = None
+        
+        # Initialize Neo4j components if configured and enabled
+        knowledge_graph_enabled = os.getenv("USE_KNOWLEDGE_GRAPH", "false") == "true"
+        
+        if knowledge_graph_enabled:
+            logger.info("Knowledge graph functionality enabled")
+            creds = get_neo4j_credentials()
+            
+            if all(creds.values()):
+                try:
+                    logger.info("Initializing knowledge graph components...")
+                    
+                    # Initialize knowledge graph validator
+                    knowledge_validator = KnowledgeGraphValidator(
+                        creds['uri'], creds['user'], creds['password']
+                    )
+                    await knowledge_validator.initialize()
+                    logger.info("✓ Knowledge graph validator initialized")
+                    
+                    # Initialize repository extractor
+                    repo_extractor = DirectNeo4jExtractor(
+                        creds['uri'], creds['user'], creds['password']
+                    )
+                    await repo_extractor.initialize()
+                    logger.info("✓ Repository extractor initialized")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to initialize Neo4j components: {format_neo4j_error(e)}")
+                    knowledge_validator = None
+                    repo_extractor = None
+            else:
+                logger.warning("Neo4j credentials not fully configured - knowledge graph tools will be unavailable")
+        else:
+            logger.info("Knowledge graph functionality disabled - set USE_KNOWLEDGE_GRAPH=true to enable")
+        
+        logger.info("Server initialization completed successfully")
+        
         yield Crawl4AIContext(
             crawler=crawler,
             db_pool=db_pool,
@@ -198,53 +252,80 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
             knowledge_validator=knowledge_validator,
             repo_extractor=repo_extractor
         )
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize server components: {e}")
+        raise
     finally:
         # Cleanup resources gracefully
-        print("Starting cleanup...")
+        logger.info("Starting cleanup...")
         
         # Close crawler
-        try:
-            await crawler.__aexit__(None, None, None)
-            print("✓ Crawler closed")
-        except Exception as e:
-            print(f"Error closing crawler: {e}")
+        if crawler:
+            try:
+                await crawler.__aexit__(None, None, None)
+                logger.info("✓ Crawler closed")
+            except Exception as e:
+                logger.error(f"Error closing crawler: {e}")
         
         # Close database pool
-        try:
-            await db_pool.close()
-            print("✓ Database pool closed")
-        except Exception as e:
-            print(f"Error closing database pool: {e}")
+        if db_pool:
+            try:
+                await close_db_pool()
+                logger.info("✓ Database pool closed")
+            except Exception as e:
+                logger.error(f"Error closing database pool: {e}")
         
         # Close knowledge graph components
         if knowledge_validator:
             try:
                 await knowledge_validator.close()
-                print("✓ Knowledge graph validator closed")
+                logger.info("✓ Knowledge graph validator closed")
             except Exception as e:
-                print(f"Error closing knowledge validator: {e}")
+                logger.error(f"Error closing knowledge validator: {e}")
                 
         if repo_extractor:
             try:
                 await repo_extractor.close()
-                print("✓ Repository extractor closed")
+                logger.info("✓ Repository extractor closed")
             except Exception as e:
-                print(f"Error closing repository extractor: {e}")
+                logger.error(f"Error closing repository extractor: {e}")
         
-        print("Cleanup completed")
+        logger.info("Cleanup completed")
 
-# Initialize FastMCP server
-mcp = FastMCP(
-    "mcp-crawl4ai-rag",
-    description="MCP server for RAG and web crawling with Crawl4AI",
-    lifespan=crawl4ai_lifespan,
-    host=os.getenv("HOST", "0.0.0.0"),
-    port=int(os.getenv("PORT", "8051"))
-)
+# Initialize FastMCP server with validation
+try:
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8051"))
+    
+    # Validate port range
+    if not (1 <= port <= 65535):
+        raise ValueError(f"Invalid port number: {port}. Must be between 1 and 65535.")
+    
+    logger.info(f"Initializing FastMCP server on {host}:{port}")
+    
+    mcp = FastMCP(
+        "mcp-crawl4ai-rag",
+        description="MCP server for RAG and web crawling with Crawl4AI",
+        lifespan=crawl4ai_lifespan,
+        host=host,
+        port=port
+    )
+    
+except Exception as e:
+    logger.error(f"Failed to initialize FastMCP server: {e}")
+    raise
 
+# Add health check endpoint
+@mcp.router.get("/health")
+async def health_check():
+    """Health check endpoint for container monitoring."""
+    return {"status": "healthy", "service": "crawl4ai-mcp"}
+
+@lru_cache(maxsize=128)
 def rerank_results(model: CrossEncoder, query: str, results: List[Dict[str, Any]], content_key: str = "content") -> List[Dict[str, Any]]:
     """
-    Rerank search results using a cross-encoder model.
+    Rerank search results using a cross-encoder model with caching.
     
     Args:
         model: The cross-encoder model to use for reranking
@@ -277,7 +358,7 @@ def rerank_results(model: CrossEncoder, query: str, results: List[Dict[str, Any]
         
         return reranked
     except Exception as e:
-        print(f"Error during reranking: {e}")
+        logger.error(f"Error during reranking: {e}")
         return results
 
 def is_sitemap(url: str) -> bool:
@@ -322,7 +403,7 @@ def parse_sitemap(sitemap_url: str) -> List[str]:
             tree = ElementTree.fromstring(resp.content)
             urls.extend([loc.text for loc in tree.findall('.//{*}loc') if loc.text])
         except Exception as e:
-            print(f"Error parsing sitemap XML: {e}")
+            logger.error(f"Error parsing sitemap XML: {e}")
 
     return urls
 
@@ -402,27 +483,36 @@ def process_code_example(args):
         The generated summary
     """
     code, context_before, context_after = args
-    return generate_code_example_summary(code, context_before, context_after)
+    # Note: This will need to be wrapped in asyncio.run() since the function is now async
+    return asyncio.run(generate_code_example_summary(code, context_before, context_after))
 
 @mcp.tool()
 async def crawl_single_page(ctx: Context, url: str) -> str:
     """
-    Crawl a single web page and store its content in Supabase.
+    Crawl a single web page and store its content in the database.
     
     This tool is ideal for quickly retrieving content from a specific URL without following links.
-    The content is stored in Supabase for later retrieval and querying.
+    The content is stored in the database for later retrieval and querying.
     
     Args:
         ctx: The MCP server provided context
         url: URL of the web page to crawl
     
     Returns:
-        Summary of the crawling operation and storage in Supabase
+        Summary of the crawling operation and storage in the database
     """
+    if not url or not isinstance(url, str):
+        return json.dumps({
+            "success": False,
+            "error": "Valid URL is required"
+        })
+    
     try:
         # Get the crawler from the context
         crawler = ctx.request_context.lifespan_context.crawler
         db_pool = ctx.request_context.lifespan_context.db_pool
+        
+        logger.info(f"Starting to crawl single page: {url}")
         
         # Configure the crawl
         run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
@@ -430,93 +520,130 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
         # Crawl the page
         result = await crawler.arun(url=url, config=run_config)
         
-        if result.success and result.markdown:
-            # Extract source_id
-            parsed_url = urlparse(url)
-            source_id = parsed_url.netloc or parsed_url.path
+        if not result.success:
+            error_msg = f"Failed to crawl URL: {result.error_message or 'Unknown error'}"
+            logger.error(error_msg)
+            return json.dumps({
+                "success": False,
+                "error": error_msg
+            })
+        
+        if not result.markdown:
+            logger.warning(f"No content found for URL: {url}")
+            return json.dumps({
+                "success": False,
+                "error": "No content found on the page"
+            })
+        
+        # Extract source_id
+        parsed_url = urlparse(url)
+        source_id = parsed_url.netloc or parsed_url.path
+        
+        # Chunk the content
+        chunks = smart_chunk_markdown(result.markdown)
+        logger.info(f"Split content into {len(chunks)} chunks")
+        
+        # Prepare data for database
+        urls = []
+        chunk_numbers = []
+        contents = []
+        metadatas = []
+        total_word_count = 0
+        
+        for i, chunk in enumerate(chunks):
+            urls.append(url)
+            chunk_numbers.append(i)
+            contents.append(chunk)
             
-            # Chunk the content
-            chunks = smart_chunk_markdown(result.markdown)
+            # Extract metadata
+            meta = extract_section_info(chunk)
+            meta["chunk_index"] = i
+            meta["url"] = url
+            meta["source"] = source_id
+            meta["crawl_timestamp"] = asyncio.current_task().get_name() if asyncio.current_task() else "unknown"
+            metadatas.append(meta)
             
-            # Prepare data for Supabase
-            urls = []
-            chunk_numbers = []
-            contents = []
-            metadatas = []
-            total_word_count = 0
+            # Accumulate word count
+            total_word_count += meta.get("word_count", 0)
+        
+        # Create url_to_full_document mapping
+        url_to_full_document = {url: result.markdown}
+        
+        # Update source information FIRST (before inserting documents)
+        logger.info("Generating source summary...")
+        source_summary = await extract_source_summary(source_id, result.markdown[:5000])  # Use first 5000 chars for summary
+        await update_source_info(db_pool, source_id, source_summary, total_word_count)
+        
+        # Add documentation chunks to DB (AFTER source exists)
+        logger.info("Storing document chunks in database...")
+        await add_documents_to_db(db_pool, urls, chunk_numbers, contents, metadatas, url_to_full_document)
+        
+        # Extract and process code examples only if enabled
+        code_examples_count = 0
+        extract_code_examples = os.getenv("USE_AGENTIC_RAG", "false") == "true"
+        
+        if extract_code_examples:
+            logger.info("Extracting code examples...")
+            code_blocks = extract_code_blocks(result.markdown)
             
-            for i, chunk in enumerate(chunks):
-                urls.append(url)
-                chunk_numbers.append(i)
-                contents.append(chunk)
+            if code_blocks:
+                logger.info(f"Found {len(code_blocks)} code blocks, processing summaries...")
                 
-                # Extract metadata
-                meta = extract_section_info(chunk)
-                meta["chunk_index"] = i
-                meta["url"] = url
-                meta["source"] = source_id
-                task = asyncio.current_task()
-                if task:
-                    coro = task.get_coro()
-                    if coro:
-                        meta["crawl_time"] = coro.__name__
-                    else:
-                        meta["crawl_time"] = "unknown"
-                else:
-                    meta["crawl_time"] = "unknown"
-                metadatas.append(meta)
+                # Process code examples with memory-aware batching
+                batch_size = int(os.getenv("CODE_PROCESSING_BATCH_SIZE", "5"))
+                code_urls = []
+                code_chunk_numbers = []
+                code_examples = []
+                code_summaries = []
+                code_metadatas = []
                 
-                # Accumulate word count
-                total_word_count += meta.get("word_count", 0)
-            
-            # Create url_to_full_document mapping
-            url_to_full_document = {url: result.markdown}
-            
-            # Update source information FIRST (before inserting documents)
-            source_summary = extract_source_summary(source_id, result.markdown[:5000])  # Use first 5000 chars for summary
-            await update_source_info(db_pool, source_id, source_summary, total_word_count)
-            
-            # Add documentation chunks to DB (AFTER source exists)
-            await add_documents_to_db(db_pool, urls, chunk_numbers, contents, metadatas, url_to_full_document)
-            
-            # Extract and process code examples only if enabled
-            extract_code_examples = os.getenv("USE_AGENTIC_RAG", "false") == "true"
-            if extract_code_examples:
-                code_blocks = extract_code_blocks(result.markdown)
-                if code_blocks:
-                    code_urls = []
-                    code_chunk_numbers = []
-                    code_examples = []
-                    code_summaries = []
-                    code_metadatas = []
+                # Process code examples in smaller batches to avoid memory issues
+                for i in range(0, len(code_blocks), batch_size):
+                    batch_end = min(i + batch_size, len(code_blocks))
+                    batch_blocks = code_blocks[i:batch_end]
                     
-                    # Process code examples in parallel
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                        # Prepare arguments for parallel processing
-                        summary_args = [(block['code'], block['context_before'], block['context_after']) 
-                                        for block in code_blocks]
+                    # Generate summaries asynchronously for this batch
+                    summary_tasks = []
+                    for block in batch_blocks:
+                        task = generate_code_example_summary(
+                            block['code'], 
+                            block['context_before'], 
+                            block['context_after']
+                        )
+                        summary_tasks.append(task)
+                    
+                    # Wait for all summaries in this batch
+                    batch_summaries = await asyncio.gather(*summary_tasks, return_exceptions=True)
+                    
+                    # Process results for this batch
+                    for j, (block, summary) in enumerate(zip(batch_blocks, batch_summaries)):
+                        global_index = i + j
                         
-                        # Generate summaries in parallel
-                        summaries = list(executor.map(process_code_example, summary_args))
-                    
-                    # Prepare code example data
-                    for i, (block, summary) in enumerate(zip(code_blocks, summaries)):
+                        # Handle exceptions in summary generation
+                        if isinstance(summary, Exception):
+                            logger.warning(f"Failed to generate summary for code block {global_index}: {summary}")
+                            summary = "Code example for demonstration purposes."
+                        
                         code_urls.append(url)
-                        code_chunk_numbers.append(i)
+                        code_chunk_numbers.append(global_index)
                         code_examples.append(block['code'])
                         code_summaries.append(summary)
                         
                         # Create metadata for code example
                         code_meta = {
-                            "chunk_index": i,
+                            "chunk_index": global_index,
                             "url": url,
                             "source": source_id,
+                            "language": block.get('language', ''),
                             "char_count": len(block['code']),
-                            "word_count": len(block['code'].split())
+                            "word_count": len(block['code'].split()),
+                            "crawl_timestamp": meta.get("crawl_timestamp", "unknown")
                         }
                         code_metadatas.append(code_meta)
-                    
-                    # Add code examples to DB
+                
+                # Add code examples to DB
+                if code_examples:
+                    logger.info(f"Storing {len(code_examples)} code examples in database...")
                     await add_code_examples_to_db(
                         db_pool, 
                         code_urls, 
@@ -525,32 +652,40 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
                         code_summaries, 
                         code_metadatas
                     )
-            
-            return json.dumps({
-                "success": True,
-                "url": url,
-                "chunks_stored": len(chunks),
-                "code_examples_stored": len(code_blocks) if code_blocks else 0,
-                "content_length": len(result.markdown),
-                "total_word_count": total_word_count,
-                "source_id": source_id,
-                "links_count": {
-                    "internal": len(result.links.get("internal", [])),
-                    "external": len(result.links.get("external", []))
-                }
-            }, indent=2)
-        else:
-            return json.dumps({
-                "success": False,
-                "url": url,
-                "error": result.error_message
-            }, indent=2)
-    except Exception as e:
+                    code_examples_count = len(code_examples)
+        
+        logger.info(f"Successfully processed page: {url}")
+        
+        return json.dumps({
+            "success": True,
+            "url": url,
+            "chunks_stored": len(chunks),
+            "code_examples_stored": code_examples_count,
+            "content_length": len(result.markdown),
+            "total_word_count": total_word_count,
+            "source_id": source_id,
+            "links_count": {
+                "internal": len(result.links.get("internal", [])) if result.links else 0,
+                "external": len(result.links.get("external", [])) if result.links else 0
+            }
+        }, indent=2)
+        
+    except EmbeddingError as e:
+        error_msg = f"Embedding generation failed: {str(e)}"
+        logger.error(error_msg)
         return json.dumps({
             "success": False,
-            "url": url,
-            "error": str(e)
-        }, indent=2)
+            "error": error_msg,
+            "type": "embedding_error"
+        })
+    except Exception as e:
+        error_msg = f"Error crawling page: {str(e)}"
+        logger.error(error_msg)
+        return json.dumps({
+            "success": False,
+            "error": error_msg,
+            "type": "crawl_error"
+        })
 
 @mcp.tool()
 async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000) -> str:
@@ -824,42 +959,78 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
     Returns:
         JSON string with the search results
     """
+    # Input validation
+    if not query or not isinstance(query, str) or not query.strip():
+        return json.dumps({
+            "success": False,
+            "error": "Query parameter is required and must be a non-empty string"
+        })
+    
+    # Validate match_count
+    if not isinstance(match_count, int) or match_count < 1 or match_count > 50:
+        return json.dumps({
+            "success": False,
+            "error": "match_count must be an integer between 1 and 50"
+        })
+    
     try:
         # Get the DB pool from the context
         db_pool = ctx.request_context.lifespan_context.db_pool
+        
+        logger.info(f"Starting RAG query: '{query}' with source filter: {source}")
         
         # Check if hybrid search is enabled
         use_hybrid_search = os.getenv("USE_HYBRID_SEARCH", "false") == "true"
         
         # Prepare filter if source is provided and not empty
-        filter_metadata = None
-        if source and source.strip():
-            filter_metadata = {"source": source}
+        source_filter = source.strip() if source and source.strip() else None
         
         if use_hybrid_search:
+            logger.debug("Using hybrid search mode")
             # Hybrid search: combine vector and keyword search
             
             # 1. Get vector search results (get more to account for filtering)
-            vector_results = await search_documents(
-                pool=db_pool,
-                query=query,
-                match_count=match_count * 2,  # Get double to have room for filtering
-                filter_metadata=filter_metadata
-            )
+            try:
+                vector_results = await search_documents(
+                    pool=db_pool,
+                    query=query,
+                    match_count=match_count * 2,  # Get double to have room for filtering
+                    source_filter=source_filter
+                )
+            except EmbeddingError as e:
+                logger.error(f"Vector search failed: {e}")
+                return json.dumps({
+                    "success": False,
+                    "error": f"Vector search failed: {str(e)}",
+                    "type": "embedding_error"
+                })
             
             # 2. Get keyword search results using ILIKE
-            async with db_pool.acquire() as connection:
-                keyword_query_str = "SELECT id, url, chunk_number, content, metadata, source_id FROM crawled_pages WHERE content ILIKE $1"
-                params: List[Any] = [f'%{query}%']
-                if source and source.strip():
-                    keyword_query_str += " AND source_id = $2"
-                    params.append(source)
-                keyword_query_str += " LIMIT $3"
-                params.append(match_count * 2)
+            try:
+                async with db_pool.acquire() as connection:
+                    keyword_query_str = """
+                        SELECT id, url, chunk_number, content, metadata, source_id, 0.5 as similarity
+                        FROM crawled_pages 
+                        WHERE content ILIKE $1
+                    """
+                    params: List[Any] = [f'%{query}%']
+                    
+                    if source_filter:
+                        keyword_query_str += " AND source_id = $2"
+                        params.append(source_filter)
+                        keyword_query_str += " LIMIT $3"
+                        params.append(match_count * 2)
+                    else:
+                        keyword_query_str += " LIMIT $2"
+                        params.append(match_count * 2)
 
-                keyword_response = await connection.fetch(keyword_query_str, *params)
-            
-            keyword_results = [dict(row) for row in keyword_response] if keyword_response else []
+                    keyword_response = await connection.fetch(keyword_query_str, *params)
+                
+                keyword_results = [dict(row) for row in keyword_response] if keyword_response else []
+            except Exception as e:
+                logger.error(f"Keyword search failed: {e}")
+                # Continue with vector results only
+                keyword_results = []
             
             # 3. Combine results with preference for items appearing in both
             seen_ids = set()
@@ -887,34 +1058,41 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
             # Finally, add pure keyword matches if we still need more results
             for kr in keyword_results:
                 if kr['id'] not in seen_ids and len(combined_results) < match_count:
-                    # Convert keyword result to match vector result format
-                    combined_results.append({
-                        'id': kr['id'],
-                        'url': kr['url'],
-                        'chunk_number': kr['chunk_number'],
-                        'content': kr['content'],
-                        'metadata': kr['metadata'],
-                        'source_id': kr['source_id'],
-                        'similarity': 0.5  # Default similarity for keyword-only matches
-                    })
+                    combined_results.append(kr)
                     seen_ids.add(kr['id'])
             
             # Use combined results
             results = combined_results[:match_count]
             
         else:
+            logger.debug("Using vector search only")
             # Standard vector search only
-            results = await search_documents(
-                pool=db_pool,
-                query=query,
-                match_count=match_count,
-                filter_metadata=filter_metadata
-            )
+            try:
+                results = await search_documents(
+                    pool=db_pool,
+                    query=query,
+                    match_count=match_count,
+                    source_filter=source_filter
+                )
+            except EmbeddingError as e:
+                logger.error(f"Vector search failed: {e}")
+                return json.dumps({
+                    "success": False,
+                    "error": f"Vector search failed: {str(e)}",
+                    "type": "embedding_error"
+                })
         
         # Apply reranking if enabled
         use_reranking = os.getenv("USE_RERANKING", "false") == "true"
-        if use_reranking and ctx.request_context.lifespan_context.reranking_model:
-            results = rerank_results(ctx.request_context.lifespan_context.reranking_model, query, results, content_key="content")
+        reranking_applied = False
+        
+        if use_reranking and ctx.request_context.lifespan_context.reranking_model and results:
+            try:
+                logger.debug("Applying reranking to results")
+                results = rerank_results(ctx.request_context.lifespan_context.reranking_model, query, results, content_key="content")
+                reranking_applied = True
+            except Exception as e:
+                logger.warning(f"Reranking failed, continuing with unranked results: {e}")
         
         # Format the results
         formatted_results = []
@@ -923,6 +1101,7 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
                 "url": result.get("url"),
                 "content": result.get("content"),
                 "metadata": result.get("metadata"),
+                "source_id": result.get("source_id"),
                 "similarity": result.get("similarity")
             }
             # Include rerank score if available
@@ -930,21 +1109,26 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
                 formatted_result["rerank_score"] = result["rerank_score"]
             formatted_results.append(formatted_result)
         
+        logger.info(f"RAG query completed. Found {len(formatted_results)} results")
+        
         return json.dumps({
             "success": True,
             "query": query,
-            "source_filter": source,
+            "source_filter": source_filter,
             "search_mode": "hybrid" if use_hybrid_search else "vector",
-            "reranking_applied": use_reranking and ctx.request_context.lifespan_context.reranking_model is not None,
+            "reranking_applied": reranking_applied,
             "results": formatted_results,
             "count": len(formatted_results)
         }, indent=2)
+        
     except Exception as e:
+        logger.error(f"Error in RAG query: {e}")
         return json.dumps({
             "success": False,
             "query": query,
-            "error": str(e)
-        }, indent=2)
+            "error": str(e),
+            "type": "query_error"
+        })
 
 @mcp.tool()
 async def search_code_examples(ctx: Context, query: str, source_id: str = None, match_count: int = 5) -> str:
@@ -971,44 +1155,81 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
     if not extract_code_examples_enabled:
         return json.dumps({
             "success": False,
-            "error": "Code example extraction is disabled. Perform a normal RAG search."
-        }, indent=2)
+            "error": "Code example extraction is disabled. Set USE_AGENTIC_RAG=true to enable this feature."
+        })
+    
+    # Input validation
+    if not query or not isinstance(query, str) or not query.strip():
+        return json.dumps({
+            "success": False,
+            "error": "Query parameter is required and must be a non-empty string"
+        })
+    
+    # Validate match_count
+    if not isinstance(match_count, int) or match_count < 1 or match_count > 50:
+        return json.dumps({
+            "success": False,
+            "error": "match_count must be an integer between 1 and 50"
+        })
     
     try:
         # Get the DB pool from the context
         db_pool = ctx.request_context.lifespan_context.db_pool
         
+        logger.info(f"Starting code examples search: '{query}' with source filter: {source_id}")
+        
         # Check if hybrid search is enabled
         use_hybrid_search = os.getenv("USE_HYBRID_SEARCH", "false") == "true"
         
         # Prepare filter if source is provided and not empty
-        filter_metadata = None
-        if source_id and source_id.strip():
-            filter_metadata = {"source": source_id}
+        source_filter = source_id.strip() if source_id and source_id.strip() else None
         
         if use_hybrid_search:
+            logger.debug("Using hybrid search mode for code examples")
             # Hybrid search: combine vector and keyword search
             
             # 1. Get vector search results (get more to account for filtering)
-            vector_results = await search_code_examples_util(
-                pool=db_pool,
-                query=query,
-                match_count=match_count * 2,  # Get double to have room for filtering
-                filter_metadata=filter_metadata
-            )
+            try:
+                vector_results = await search_code_examples_util(
+                    pool=db_pool,
+                    query=query,
+                    match_count=match_count * 2,  # Get double to have room for filtering
+                    source_id=source_filter
+                )
+            except EmbeddingError as e:
+                logger.error(f"Vector search for code examples failed: {e}")
+                return json.dumps({
+                    "success": False,
+                    "error": f"Vector search failed: {str(e)}",
+                    "type": "embedding_error"
+                })
             
             # 2. Get keyword search results using ILIKE on both content and summary
-            async with db_pool.acquire() as connection:
-                keyword_query_str = "SELECT id, url, chunk_number, content, summary, metadata, source_id FROM code_examples WHERE (content ILIKE $1 OR summary ILIKE $1)"
-                params: List[Any] = [f'%{query}%']
-                if source_id and source_id.strip():
-                    keyword_query_str += " AND source_id = $2"
-                    params.append(source_id)
-                keyword_query_str += " LIMIT $3"
-                params.append(match_count * 2)
-                keyword_response = await connection.fetch(keyword_query_str, *params)
+            try:
+                async with db_pool.acquire() as connection:
+                    keyword_query_str = """
+                        SELECT id, url, chunk_number, content, summary, metadata, source_id, 0.5 as similarity
+                        FROM code_examples 
+                        WHERE (content ILIKE $1 OR summary ILIKE $1)
+                    """
+                    params: List[Any] = [f'%{query}%']
+                    
+                    if source_filter:
+                        keyword_query_str += " AND source_id = $2"
+                        params.append(source_filter)
+                        keyword_query_str += " LIMIT $3"
+                        params.append(match_count * 2)
+                    else:
+                        keyword_query_str += " LIMIT $2"
+                        params.append(match_count * 2)
+                        
+                    keyword_response = await connection.fetch(keyword_query_str, *params)
 
-            keyword_results = [dict(row) for row in keyword_response] if keyword_response else []
+                keyword_results = [dict(row) for row in keyword_response] if keyword_response else []
+            except Exception as e:
+                logger.error(f"Keyword search for code examples failed: {e}")
+                # Continue with vector results only
+                keyword_results = []
             
             # 3. Combine results with preference for items appearing in both
             seen_ids = set()
@@ -1036,35 +1257,41 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
             # Finally, add pure keyword matches if we still need more results
             for kr in keyword_results:
                 if kr['id'] not in seen_ids and len(combined_results) < match_count:
-                    # Convert keyword result to match vector result format
-                    combined_results.append({
-                        'id': kr['id'],
-                        'url': kr['url'],
-                        'chunk_number': kr['chunk_number'],
-                        'content': kr['content'],
-                        'summary': kr['summary'],
-                        'metadata': kr['metadata'],
-                        'source_id': kr['source_id'],
-                        'similarity': 0.5  # Default similarity for keyword-only matches
-                    })
+                    combined_results.append(kr)
                     seen_ids.add(kr['id'])
             
             # Use combined results
             results = combined_results[:match_count]
             
         else:
+            logger.debug("Using vector search only for code examples")
             # Standard vector search only
-            results = await search_code_examples_util(
-                pool=db_pool,
-                query=query,
-                match_count=match_count,
-                filter_metadata=filter_metadata
-            )
+            try:
+                results = await search_code_examples_util(
+                    pool=db_pool,
+                    query=query,
+                    match_count=match_count,
+                    source_id=source_filter
+                )
+            except EmbeddingError as e:
+                logger.error(f"Vector search for code examples failed: {e}")
+                return json.dumps({
+                    "success": False,
+                    "error": f"Vector search failed: {str(e)}",
+                    "type": "embedding_error"
+                })
         
         # Apply reranking if enabled
         use_reranking = os.getenv("USE_RERANKING", "false") == "true"
-        if use_reranking and ctx.request_context.lifespan_context.reranking_model:
-            results = rerank_results(ctx.request_context.lifespan_context.reranking_model, query, results, content_key="content")
+        reranking_applied = False
+        
+        if use_reranking and ctx.request_context.lifespan_context.reranking_model and results:
+            try:
+                logger.debug("Applying reranking to code examples")
+                results = rerank_results(ctx.request_context.lifespan_context.reranking_model, query, results, content_key="content")
+                reranking_applied = True
+            except Exception as e:
+                logger.warning(f"Reranking failed, continuing with unranked results: {e}")
         
         # Format the results
         formatted_results = []
@@ -1082,21 +1309,26 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
                 formatted_result["rerank_score"] = result["rerank_score"]
             formatted_results.append(formatted_result)
         
+        logger.info(f"Code examples search completed. Found {len(formatted_results)} results")
+        
         return json.dumps({
             "success": True,
             "query": query,
-            "source_filter": source_id,
+            "source_filter": source_filter,
             "search_mode": "hybrid" if use_hybrid_search else "vector",
-            "reranking_applied": use_reranking and ctx.request_context.lifespan_context.reranking_model is not None,
+            "reranking_applied": reranking_applied,
             "results": formatted_results,
             "count": len(formatted_results)
         }, indent=2)
+        
     except Exception as e:
+        logger.error(f"Error in code examples search: {e}")
         return json.dumps({
             "success": False,
             "query": query,
-            "error": str(e)
-        }, indent=2)
+            "error": str(e),
+            "type": "query_error"
+        })
 
 @mcp.tool()
 async def check_ai_script_hallucinations(ctx: Context, script_path: str) -> str:
