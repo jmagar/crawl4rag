@@ -1,4 +1,33 @@
-crawl4ai_mcp.egg-info
-__pycache__
-.venv
+# Prevent secrets from being copied into Docker images
+secrets/
+*.txt
+
+# Development files
+.git/
 .env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Documentation and analysis files
+CODEBASE_ANALYSIS.md
+FIXES_IMPLEMENTED.md
+.claude/
+
+# Test files
+test_script_hallucination*
+repos/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+crawl4ai_mcp.egg-info
