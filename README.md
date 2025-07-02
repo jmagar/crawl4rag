@@ -109,11 +109,17 @@ HOST=0.0.0.0
 PORT=8051
 TRANSPORT=sse
 
-# OpenAI API Configuration
+# OpenAI API Key (required for contextual embeddings)
 OPENAI_API_KEY=your_openai_api_key
 
-# LLM for summaries and contextual embeddings
-MODEL_CHOICE=gpt-4.1-nano
+# Embedding configuration (for /v1/embeddings endpoint)
+# Must end with a trailing slash if pointing at a custom OpenAI-compatible server (e.g., LM Studio, Ollama, Groq)
+EMBEDDING_URL=http://localhost:1234/v1/
+# The model identifier served by the embedding endpoint above
+EMBEDDING_MODEL=text-embedding-bge-m3
+
+# LLM used for summaries and contextual embeddings (chat-completion)
+CONTEXTUAL_MODEL=gpt-4o-mini
 
 # RAG Strategies (set to "true" or "false", default to "false")
 USE_CONTEXTUAL_EMBEDDINGS=false
@@ -140,7 +146,7 @@ NEO4J_PASSWORD=your_neo4j_password
 The Crawl4AI RAG MCP server supports four powerful RAG strategies that can be enabled independently:
 
 #### 1. **USE_CONTEXTUAL_EMBEDDINGS**
-When enabled, this strategy enhances each chunk's embedding with additional context from the entire document. The system passes both the full document and the specific chunk to an LLM (configured via `MODEL_CHOICE`) to generate enriched context that gets embedded alongside the chunk content.
+When enabled, this strategy enhances each chunk's embedding with additional context from the entire document. The system passes both the full document and the specific chunk to an LLM (configured via `CONTEXTUAL_MODEL`) to generate enriched context that gets embedded alongside the chunk content.
 
 - **When to use**: Enable this when you need high-precision retrieval where context matters, such as technical documentation where terms might have different meanings in different sections.
 - **Trade-offs**: Slower indexing due to LLM calls for each chunk, but significantly better retrieval accuracy.

@@ -25,7 +25,7 @@ class GraphitiDependencies:
 # ========== Helper function to get model configuration ==========
 def get_model():
     """Configure and return the LLM model to use."""
-    model_choice = os.getenv('MODEL_CHOICE', 'gpt-4.1-mini')
+    model_choice = os.getenv('CONTEXTUAL_MODEL', 'gpt-4o-mini')
     api_key = os.getenv('OPENAI_API_KEY', 'no-api-key-provided')
 
     return OpenAIModel(model_choice, provider=OpenAIProvider(api_key=api_key))

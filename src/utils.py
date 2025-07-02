@@ -8,11 +8,33 @@ import json
 import asyncpg
 from urllib.parse import urlparse
 import openai
+from openai import OpenAI
 import re
 import time
 
-# Load OpenAI API key for embeddings
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# -----------------------------------------------------------------------------
+# OpenAI client configuration
+# -----------------------------------------------------------------------------
+# We separate the client used for embeddings (can point to any OpenAI-compatible
+# server such as LM Studio) from the default OpenAI client that talks to
+# api.openai.com for contextual embeddings.
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Embedding endpoint & model
+EMBEDDING_URL = os.getenv("EMBEDDING_URL", "https://api.openai.com/v1/")
+if not EMBEDDING_URL.endswith("/"):
+    EMBEDDING_URL += "/"
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-bge-m3")
+
+# Contextual-embedding (chat) model – still uses OpenAI cloud by default
+CONTEXTUAL_MODEL = os.getenv("CONTEXTUAL_MODEL", "gpt-4o-mini")
+
+# Dedicated client for embeddings so we don't have to keep mutating global state
+embedding_client = OpenAI(api_key=OPENAI_API_KEY, base_url=EMBEDDING_URL)
+
+# Leave the default openai client pointing at api.openai.com for chat completions
+openai.api_key = OPENAI_API_KEY
 
 async def get_db_pool():
     """
@@ -44,8 +66,8 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     
     for retry in range(max_retries):
         try:
-            response = openai.embeddings.create(
-                model="text-embedding-3-small", # Hardcoding embedding model for now, will change this later to be more dynamic
+            response = embedding_client.embeddings.create(
+                model=EMBEDDING_MODEL,
                 input=texts
             )
             return [item.embedding for item in response.data]
@@ -64,8 +86,8 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
                 
                 for i, text in enumerate(texts):
                     try:
-                        individual_response = openai.embeddings.create(
-                            model="text-embedding-3-small",
+                        individual_response = embedding_client.embeddings.create(
+                            model=EMBEDDING_MODEL,
                             input=[text]
                         )
                         embeddings.append(individual_response.data[0].embedding)
@@ -89,7 +111,7 @@ def create_embedding(text: str) -> List[float]:
     Returns:
         List of floats representing the embedding
     """
-    model_choice = os.getenv("MODEL_CHOICE", "gpt-4.1-nano")
+    model_choice = CONTEXTUAL_MODEL
     
     try:
         embeddings = create_embeddings_batch([text])
@@ -112,7 +134,7 @@ def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, 
         - The contextual text that situates the chunk within the document
         - Boolean indicating if contextual embedding was performed
     """
-    model_choice = os.getenv("MODEL_CHOICE", "gpt-4.1-nano")
+    model_choice = CONTEXTUAL_MODEL
     
     try:
         # Create the prompt for generating contextual information
@@ -435,7 +457,7 @@ def generate_code_example_summary(code: str, context_before: str, context_after:
     Returns:
         A summary of what the code example demonstrates
     """
-    model_choice = os.getenv("MODEL_CHOICE", "gpt-4.1-nano")
+    model_choice = CONTEXTUAL_MODEL
     
     # Create the prompt
     prompt = f"""<context_before>
@@ -578,7 +600,7 @@ def extract_source_summary(source_id: str, content: str, max_length: int = 500) 
         return default_summary
     
     # Get the model choice from environment variables
-    model_choice = os.getenv("MODEL_CHOICE", "gpt-4.1-nano")
+    model_choice = CONTEXTUAL_MODEL
     
     # Limit content length to avoid token limits
     truncated_content = content[:25000] if len(content) > 25000 else content
