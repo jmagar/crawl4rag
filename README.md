@@ -115,6 +115,46 @@ The recommended way to run the server is with Docker Compose, which orchestrates
     ```
     This command will build the MCP server image, start all the services, and automatically set up the PostgreSQL database with the necessary tables and functions from `crawled_pages.sql`.
 
+## Migration to 1024-Dimensional Embeddings
+
+If you're upgrading from a previous version that used 1536-dimensional embeddings, you'll need to run a migration to ensure compatibility with the current BGE-M3 embedding model (which natively produces 1024-dimensional vectors).
+
+### Quick Migration (Recommended)
+
+**⚠️ This will delete all existing crawled data**
+
+```bash
+# Connect to your PostgreSQL database and run the migration
+psql -h localhost -U your_postgres_user -d crawl4rag -f migrate_to_1024_dimensions.sql
+```
+
+Or if using Docker:
+```bash
+docker-compose exec postgres psql -U your_postgres_user -d crawl4rag -f /app/migrate_to_1024_dimensions.sql
+```
+
+### Verify Migration
+
+After running the migration, verify everything is working correctly:
+
+```bash
+# Run the verification script
+python verify_embedding_dimensions.py
+```
+
+This script will:
+- ✅ Test that embeddings are generated with 1024 dimensions
+- ✅ Verify database schema is correctly configured
+- ✅ Test embedding serialization/storage
+
+### What Changed
+
+- **Embedding dimensions**: Changed from 1536 → 1024 to match BGE-M3 model output
+- **Database schema**: Updated `vector(1536)` → `vector(1024)` in both `crawled_pages` and `code_examples` tables
+- **Embedding generation**: Added dimension normalization to ensure consistent 1024-dimensional output
+
+The system will now work optimally with the BGE-M3 embedding model and provide better performance with the correct vector dimensions.
+
 ## Configuration
 
 Your `.env` file controls the server configuration.
