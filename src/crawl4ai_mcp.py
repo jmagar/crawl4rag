@@ -10,8 +10,8 @@ from sentence_transformers import CrossEncoder
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Tuple, cast
-from urllib.parse import urlparse, urldefrag, urljoin
+from typing import List, Dict, Any, Optional, cast
+from urllib.parse import urlparse, urldefrag
 from xml.etree import ElementTree
 from dotenv import load_dotenv
 import asyncpg
@@ -24,7 +24,6 @@ import re
 import concurrent.futures
 import sys
 import logging
-from functools import lru_cache
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
 
