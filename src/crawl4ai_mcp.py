@@ -24,6 +24,7 @@ import re
 import concurrent.futures
 import sys
 import logging
+import time
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
 
@@ -505,6 +506,10 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
             "error": "Valid URL is required"
         })
     
+    import time
+    start_time = time.time()
+    timing_data = {}
+    
     try:
         # Get the crawler from the context
         crawler = ctx.request_context.lifespan_context.crawler
@@ -515,8 +520,11 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
         # Configure the crawl
         run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
         
-        # Crawl the page
+        # Crawl the page - Track crawling time
+        crawl_start = time.time()
         result = await crawler.arun(url=url, config=run_config)
+        crawl_end = time.time()
+        timing_data["page_crawl_seconds"] = round(crawl_end - crawl_start, 2)
         
         if not result.success:
             error_msg = f"Failed to crawl URL: {result.error_message or 'Unknown error'}"
@@ -537,8 +545,11 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
         parsed_url = urlparse(url)
         source_id = parsed_url.netloc or parsed_url.path
         
-        # Chunk the content
+        # Chunk the content - Track chunking time
+        chunk_start = time.time()
         chunks = smart_chunk_markdown(result.markdown)
+        chunk_end = time.time()
+        timing_data["content_chunking_seconds"] = round(chunk_end - chunk_start, 2)
         logger.info(f"Split content into {len(chunks)} chunks")
         
         # Prepare data for database
@@ -569,19 +580,26 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
         url_to_full_document = {url: result.markdown}
         
         # Update source information FIRST (before inserting documents)
+        source_start = time.time()
         logger.info("Generating source summary...")
         source_summary = await extract_source_summary(source_id, result.markdown[:5000])  # Use first 5000 chars for summary
         await update_source_info(db_pool, source_id, source_summary, total_word_count)
+        source_end = time.time()
+        timing_data["source_processing_seconds"] = round(source_end - source_start, 2)
         
-        # Add documentation chunks to DB (AFTER source exists)
+        # Add documentation chunks to DB (AFTER source exists) - Track embedding + storage time
+        db_start = time.time()
         logger.info("Storing document chunks in database...")
         await add_documents_to_db(db_pool, urls, chunk_numbers, contents, metadatas, url_to_full_document)
+        db_end = time.time()
+        timing_data["embedding_and_storage_seconds"] = round(db_end - db_start, 2)
         
         # Extract and process code examples only if enabled
         code_examples_count = 0
         extract_code_examples = os.getenv("USE_AGENTIC_RAG", "false") == "true"
         
         if extract_code_examples:
+            code_start = time.time()
             logger.info("Extracting code examples...")
             code_blocks = extract_code_blocks(result.markdown)
             
@@ -652,8 +670,15 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
                         code_metadatas
                     )
                     code_examples_count = len(code_examples)
+            
+            code_end = time.time()
+            timing_data["code_examples_seconds"] = round(code_end - code_start, 2)
         
-        logger.info(f"Successfully processed page: {url}")
+        # Calculate total time
+        end_time = time.time()
+        timing_data["total_seconds"] = round(end_time - start_time, 2)
+        
+        logger.info(f"Successfully processed page: {url} in {timing_data['total_seconds']} seconds")
         
         return json.dumps({
             "success": True,
@@ -666,7 +691,8 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
             "links_count": {
                 "internal": len(result.links.get("internal", [])) if result.links else 0,
                 "external": len(result.links.get("external", [])) if result.links else 0
-            }
+            },
+            "performance": timing_data
         }, indent=2)
         
     except EmbeddingError as e:
@@ -708,12 +734,16 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
     Returns:
         JSON string with crawl summary and storage information
     """
+    start_time = time.time()
+    timing_data = {}
+    
     try:
         # Get the crawler from the context
         crawler = ctx.request_context.lifespan_context.crawler
         db_pool = ctx.request_context.lifespan_context.db_pool
         
-        # Determine the crawl strategy
+        # Determine the crawl strategy - Track strategy detection time
+        strategy_start = time.time()
         crawl_results = []
         crawl_type = None
         
@@ -737,6 +767,10 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             crawl_results = await crawl_recursive_internal_links(crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent)
             crawl_type = "webpage"
         
+        strategy_end = time.time()
+        timing_data["crawl_strategy_and_pages_seconds"] = round(strategy_end - strategy_start, 2)
+        timing_data["pages_crawled"] = len(crawl_results)
+        
         if not crawl_results:
             return json.dumps({
                 "success": False,
@@ -744,7 +778,8 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 "error": "No content found"
             }, indent=2)
         
-        # Process results and store in Supabase
+        # Process results and store in Supabase - Track content processing time
+        processing_start = time.time()
         urls = []
         chunk_numbers = []
         contents = []
@@ -797,12 +832,17 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 
                 chunk_count += 1
         
+        processing_end = time.time()
+        timing_data["content_processing_seconds"] = round(processing_end - processing_start, 2)
+        timing_data["total_chunks"] = chunk_count
+        
         # Create url_to_full_document mapping
         url_to_full_document = {}
         for doc in crawl_results:
             url_to_full_document[doc['url']] = doc['markdown']
         
-        # Update source information for each unique source FIRST (before inserting documents)
+        # Update source information for each unique source FIRST (before inserting documents) - Track source processing
+        source_start = time.time()
         source_summary_args = [
             (sid, content) for sid, content in source_content_map.items()
         ]
@@ -831,14 +871,21 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             word_count = source_word_counts.get(source_id, 0)
             await update_source_info(db_pool, source_id, summary, word_count)
         
-        # Add documentation chunks to DB (AFTER sources exist)
+        source_end = time.time()
+        timing_data["source_processing_seconds"] = round(source_end - source_start, 2)
+        
+        # Add documentation chunks to DB (AFTER sources exist) - Track embedding + storage time
+        db_start = time.time()
         batch_size = 20
         await add_documents_to_db(db_pool, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
+        db_end = time.time()
+        timing_data["embedding_and_storage_seconds"] = round(db_end - db_start, 2)
         
-        # Extract and process code examples from all documents only if enabled
+        # Extract and process code examples from all documents only if enabled - Track code examples time
         extract_code_examples_enabled = os.getenv("USE_AGENTIC_RAG", "false") == "true"
         code_examples = []
         if extract_code_examples_enabled:
+            code_start = time.time()
             all_code_blocks = []
             code_urls = []
             code_chunk_numbers = []
@@ -903,6 +950,21 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                     code_metadatas,
                     batch_size=batch_size
                 )
+            
+            code_end = time.time()
+            timing_data["code_examples_seconds"] = round(code_end - code_start, 2)
+        
+        # Calculate total time
+        end_time = time.time()
+        timing_data["total_seconds"] = round(end_time - start_time, 2)
+        
+        # Calculate performance metrics
+        if timing_data["total_seconds"] > 0:
+            timing_data["pages_per_second"] = round(len(crawl_results) / timing_data["total_seconds"], 2)
+            timing_data["chunks_per_second"] = round(chunk_count / timing_data["total_seconds"], 2)
+        
+        logger.info(f"Smart crawl completed in {timing_data['total_seconds']} seconds - "
+                   f"{len(crawl_results)} pages, {chunk_count} chunks")
         
         return json.dumps({
             "success": True,
@@ -912,7 +974,8 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             "chunks_stored": chunk_count,
             "code_examples_stored": len(code_examples),
             "sources_updated": len(source_content_map),
-            "urls_crawled": [doc['url'] for doc in crawl_results][:5] + (["..."] if len(crawl_results) > 5 else [])
+            "urls_crawled": [doc['url'] for doc in crawl_results][:5] + (["..."] if len(crawl_results) > 5 else []),
+            "performance": timing_data
         }, indent=2)
     except Exception as e:
         return json.dumps({

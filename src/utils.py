@@ -403,9 +403,17 @@ async def generate_contextual_embeddings_batch(
     """
     Generate contextual embeddings using intelligent batching based on OpenAI tier limits.
     """
+    batch_start_time = time.time()
+    
     if not openai_config.use_intelligent_batching:
         # Fall back to individual processing
-        return await _fallback_individual_context(full_document, chunks)
+        logger.info(f"Intelligent batching disabled - processing {len(chunks)} chunks individually")
+        individual_start = time.time()
+        result = await _fallback_individual_context(full_document, chunks)
+        individual_end = time.time()
+        logger.info(f"Individual processing took {individual_end - individual_start:.2f} seconds "
+                   f"({len(chunks)} chunks = {(individual_end - individual_start) / len(chunks):.3f}s per chunk)")
+        return result
     
     config = calculate_optimal_batch_size(tier)
     
@@ -413,8 +421,12 @@ async def generate_contextual_embeddings_batch(
     batch_size = openai_config.contextual_batch_size_override or config["max_chunks_per_batch"]
     max_concurrent = min(config["max_concurrent_requests"], 20)  # Safety cap
     
-    logger.info(f"Processing {len(chunks)} chunks with Tier {tier} limits: "
-                f"batch_size={batch_size}, max_concurrent={max_concurrent}")
+    num_batches = (len(chunks) + batch_size - 1) // batch_size  # Ceiling division
+    estimated_api_calls = num_batches
+    
+    logger.info(f"Intelligent batching enabled - processing {len(chunks)} chunks with Tier {tier} limits: "
+                f"batch_size={batch_size}, max_concurrent={max_concurrent}, "
+                f"estimated_api_calls={estimated_api_calls} (vs {len(chunks)} individual calls)")
     
     # Split chunks into batches
     batches = [chunks[i:i + batch_size] for i in range(0, len(chunks), batch_size)]
@@ -427,19 +439,45 @@ async def generate_contextual_embeddings_batch(
             return await _generate_multi_chunk_context(full_document, batch_chunks)
     
     # Process all batches concurrently
+    batch_processing_start = time.time()
     tasks = [process_batch(batch) for batch in batches]
     batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+    batch_processing_end = time.time()
     
     # Flatten results
     results = []
+    successful_batches = 0
+    failed_batches = 0
+    
     for batch_idx, batch_result in enumerate(batch_results):
         if isinstance(batch_result, Exception):
             logger.error(f"Batch {batch_idx} failed: {batch_result}")
             # Add fallback results for failed batch
             batch_chunks = batches[batch_idx]
             results.extend([(chunk, False) for chunk in batch_chunks])
-        else:
+            failed_batches += 1
+        elif isinstance(batch_result, list):
             results.extend(batch_result)
+            successful_batches += 1
+        else:
+            # Handle unexpected result type
+            logger.warning(f"Unexpected batch result type: {type(batch_result)}")
+            batch_chunks = batches[batch_idx]
+            results.extend([(chunk, False) for chunk in batch_chunks])
+            failed_batches += 1
+    
+    total_time = time.time() - batch_start_time
+    batch_processing_time = batch_processing_end - batch_processing_start
+    
+    # Calculate performance metrics
+    actual_api_calls = successful_batches + failed_batches * len(batches[0])  # Estimate for failed batches
+    api_call_reduction = ((len(chunks) - actual_api_calls) / len(chunks)) * 100 if len(chunks) > 0 else 0
+    
+    logger.info(f"Contextual embedding batching completed in {total_time:.2f}s - "
+               f"Processed {len(chunks)} chunks in {successful_batches} successful batches "
+               f"({failed_batches} failed). "
+               f"API call reduction: {api_call_reduction:.1f}% "
+               f"({actual_api_calls} calls vs {len(chunks)} individual calls)")
     
     return results
 
@@ -475,7 +513,10 @@ Respond with exactly {len(chunks)} lines, each starting with "CHUNK_X:" followed
             max_tokens=min(len(chunks) * 50, 500)  # Scale with chunk count
         )
         
-        content = response.choices[0].message.content.strip()
+        content = response.choices[0].message.content
+        if content is None:
+            content = ""
+        content = content.strip()
         lines = content.split('\n')
         
         # Parse responses
