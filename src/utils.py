@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 # OpenAI clients will be initialized after configuration is loaded
 embedding_client: OpenAI
 async_openai_client: AsyncOpenAI
-contextual_semaphore: asyncio.Semaphore
 
 @dataclass
 class DatabaseConfig:
@@ -100,9 +99,7 @@ class OpenAIConfig:
     contextual_model: str
     max_retries: int = 3
     retry_delay: float = 1.0
-    # New contextual embedding optimization settings
-    contextual_concurrency_limit: int = 10
-    contextual_requests_per_minute: int = 3000
+    # Contextual embedding optimization settings
     contextual_max_tokens: int = 75
     contextual_document_limit: int = 15000
     
@@ -124,8 +121,6 @@ class OpenAIConfig:
             contextual_model=os.getenv("CONTEXTUAL_MODEL", "gpt-4o-mini"),
             max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "3")),
             retry_delay=float(os.getenv("OPENAI_RETRY_DELAY", "1.0")),
-            contextual_concurrency_limit=int(os.getenv("CONTEXTUAL_CONCURRENCY_LIMIT", "10")),
-            contextual_requests_per_minute=int(os.getenv("CONTEXTUAL_REQUESTS_PER_MINUTE", "3000")),
             contextual_max_tokens=int(os.getenv("CONTEXTUAL_MAX_TOKENS", "75")),
             contextual_document_limit=int(os.getenv("CONTEXTUAL_DOCUMENT_LIMIT", "15000"))
         )
@@ -146,12 +141,8 @@ embedding_client = OpenAI(api_key=openai_config.api_key, base_url=openai_config.
 # Async client for contextual embeddings
 async_openai_client = AsyncOpenAI(api_key=openai_config.api_key)
 
-# Create semaphore for contextual embeddings concurrency control
-contextual_semaphore = asyncio.Semaphore(openai_config.contextual_concurrency_limit)
-
 logger.info(f"Configured OpenAI clients - Embedding: {openai_config.embedding_model}, "
-            f"Contextual: {openai_config.contextual_model}, "
-            f"Concurrency limit: {openai_config.contextual_concurrency_limit}")
+            f"Contextual: {openai_config.contextual_model}")
 
 # Global connection pool (will be initialized once)
 _db_pool: Optional[asyncpg.Pool] = None
@@ -309,10 +300,8 @@ async def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple
         - Boolean indicating if contextual embedding was performed
     """
     try:
-        # Use semaphore to limit concurrent API calls
-        async with contextual_semaphore:
-            # Create the prompt with reduced document size for faster processing
-            prompt = f"""<document> 
+        # Create the prompt with reduced document size for faster processing
+        prompt = f"""<document> 
 {full_document[:openai_config.contextual_document_limit]} 
 </document>
 Here is the chunk we want to situate within the whole document 
@@ -321,24 +310,24 @@ Here is the chunk we want to situate within the whole document
 </chunk> 
 Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else. Keep it under 50 words."""
 
-            # Call the OpenAI API with reduced token limits for faster responses
-            response = await async_openai_client.chat.completions.create(
-                model=openai_config.contextual_model,
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that provides concise contextual information in 50 words or less."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                max_tokens=openai_config.contextual_max_tokens  # Reduced from 200 to 75
-            )
-            
-            # Extract the generated context
-            context = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
-            
-            # Combine the context with the original chunk
-            contextual_text = f"{context}\n---\n{chunk}"
-            
-            return contextual_text, True
+        # Call the OpenAI API with reduced token limits for faster responses
+        response = await async_openai_client.chat.completions.create(
+            model=openai_config.contextual_model,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that provides concise contextual information in 50 words or less."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=openai_config.contextual_max_tokens  # Reduced from 200 to 75
+        )
+        
+        # Extract the generated context
+        context = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
+        
+        # Combine the context with the original chunk
+        contextual_text = f"{context}\n---\n{chunk}"
+        
+        return contextual_text, True
     
     except Exception as e:
         logger.warning(f"Error generating contextual embedding: {e}. Using original chunk instead.")
