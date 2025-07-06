@@ -7,3 +7,8 @@ repos
 test_script_hallucination*
 secrets/*.txt
 secrets/
+.cache
+.config
+.crawl4ai
+.pki
+.pdm-build

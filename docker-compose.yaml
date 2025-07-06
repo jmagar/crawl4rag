@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   crawl4rag:
     labels:
@@ -8,6 +6,9 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: crawl4rag
+    command: python src/crawl4ai_mcp.py
+    volumes:
+      - .:/app
     ports:
       - "${PORT:-8051}:${PORT:-8051}"
     env_file:

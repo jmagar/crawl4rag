@@ -734,6 +734,13 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
     Returns:
         JSON string with crawl summary and storage information
     """
+    # Input validation
+    if not url or not isinstance(url, str):
+        return json.dumps({
+            "success": False,
+            "error": "Valid URL is required"
+        }, indent=2)
+    
     start_time = time.time()
     timing_data = {}
     
@@ -741,6 +748,22 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         # Get the crawler from the context
         crawler = ctx.request_context.lifespan_context.crawler
         db_pool = ctx.request_context.lifespan_context.db_pool
+        
+        if not crawler:
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "error": "Crawler not available in context"
+            }, indent=2)
+        
+        if not db_pool:
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "error": "Database pool not available in context"
+            }, indent=2)
+        
+        logger.info(f"Starting smart crawl for URL: {url}")
         
         # Determine the crawl strategy - Track strategy detection time
         strategy_start = time.time()
@@ -816,15 +839,8 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 meta["url"] = source_url
                 meta["source"] = source_id
                 meta["crawl_type"] = crawl_type
-                task = asyncio.current_task()
-                if task:
-                    coro = task.get_coro()
-                    if coro:
-                        meta["crawl_time"] = coro.__name__
-                    else:
-                        meta["crawl_time"] = "unknown"
-                else:
-                    meta["crawl_time"] = "unknown"
+                current_task = asyncio.current_task()
+                meta["crawl_timestamp"] = current_task.get_name() if current_task else "unknown"
                 metadatas.append(meta)
                 
                 # Accumulate word count
@@ -977,11 +993,23 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             "urls_crawled": [doc['url'] for doc in crawl_results][:5] + (["..."] if len(crawl_results) > 5 else []),
             "performance": timing_data
         }, indent=2)
-    except Exception as e:
+    except EmbeddingError as e:
+        error_msg = f"Embedding generation failed: {str(e)}"
+        logger.error(error_msg)
         return json.dumps({
             "success": False,
             "url": url,
-            "error": str(e)
+            "error": error_msg,
+            "type": "embedding_error"
+        }, indent=2)
+    except Exception as e:
+        error_msg = f"Error during smart crawl: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return json.dumps({
+            "success": False,
+            "url": url,
+            "error": error_msg,
+            "type": "crawl_error"
         }, indent=2)
 
 @mcp.tool()

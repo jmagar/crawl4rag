@@ -585,106 +585,106 @@ async def add_documents_to_db(
     use_contextual_embeddings = os.getenv("USE_CONTEXTUAL_EMBEDDINGS", "false") == "true"
     logger.info("Using contextual embeddings: %s", use_contextual_embeddings)
 
-    async with pool.acquire() as connection, connection.transaction():
-        try:
-            if unique_urls:
-                await connection.execute(
-                    "DELETE FROM crawled_pages WHERE url = ANY($1)", unique_urls
-                )
-                logger.info("Deleted existing records for %s URLs", len(unique_urls))
-
-            total_processed = 0
-
-            for start in range(0, len(contents), batch_size):
-                end = min(start + batch_size, len(contents))
-
-                batch_urls = urls[start:end]
-                batch_chunk_numbers = chunk_numbers[start:end]
-                batch_contents = contents[start:end]
-                batch_metadatas = [meta.copy() for meta in metadatas[start:end]]
-
-                            # Contextual embedding (optional) - now with intelligent batching
-            if use_contextual_embeddings:
-                # Group chunks by document to enable better batching
-                doc_to_chunks = {}
-                for i, (url, content) in enumerate(zip(batch_urls, batch_contents)):
-                    full_doc = url_to_full_document.get(url, "")
-                    if full_doc not in doc_to_chunks:
-                        doc_to_chunks[full_doc] = []
-                    doc_to_chunks[full_doc].append((i, content))
-                
-                # Process each document's chunks using intelligent batching
-                all_results: List[Optional[Tuple[str, bool]]] = [None] * len(batch_contents)
-                
-                for full_doc, chunks_with_indices in doc_to_chunks.items():
-                    indices, chunks = zip(*chunks_with_indices)
-                    
-                    # Use intelligent batching based on OpenAI tier
-                    contextual_results = await generate_contextual_embeddings_batch(
-                        full_doc, list(chunks), openai_config.openai_tier
+    async with pool.acquire() as connection:
+        total_processed = 0
+        
+        # Start transaction
+        async with connection.transaction():
+            try:
+                if unique_urls:
+                    await connection.execute(
+                        "DELETE FROM crawled_pages WHERE url = ANY($1)", unique_urls
                     )
-                    
-                    # Map results back to original positions
-                    for idx, result in zip(indices, contextual_results):
-                        all_results[idx] = result
-                
-                # Build contextual_contents from results
-                contextual_contents: List[str] = []
-                for i, result in enumerate(all_results):
-                    if result and result[1]:  # Successfully generated context
-                        contextual_contents.append(result[0])
-                        batch_metadatas[i]["contextual_embedding"] = True
+                    logger.info("Deleted existing records for %s URLs", len(unique_urls))
+
+                for start in range(0, len(contents), batch_size):
+                    end = min(start + batch_size, len(contents))
+
+                    batch_urls = urls[start:end]
+                    batch_chunk_numbers = chunk_numbers[start:end]
+                    batch_contents = contents[start:end]
+                    batch_metadatas = [meta.copy() for meta in metadatas[start:end]]
+
+                    # Contextual embedding (optional)
+                    if use_contextual_embeddings:
+                        try:
+                            # Group chunks by document to enable better batching
+                            doc_to_chunks = {}
+                            for i, (url, content) in enumerate(zip(batch_urls, batch_contents)):
+                                full_doc = url_to_full_document.get(url, "")
+                                if full_doc not in doc_to_chunks:
+                                    doc_to_chunks[full_doc] = []
+                                doc_to_chunks[full_doc].append((i, content))
+                            
+                            # Process each document's chunks
+                            all_results: List[Optional[Tuple[str, bool]]] = [None] * len(batch_contents)
+                            for full_doc, chunks_with_indices in doc_to_chunks.items():
+                                indices, chunks = zip(*chunks_with_indices)
+                                contextual_results = await generate_contextual_embeddings_batch(
+                                    full_doc, list(chunks), openai_config.openai_tier
+                                )
+                                for idx, result in zip(indices, contextual_results):
+                                    all_results[idx] = result
+                            
+                            contextual_contents: List[str] = []
+                            for i, result in enumerate(all_results):
+                                if result and result[1]:
+                                    contextual_contents.append(result[0])
+                                    batch_metadatas[i]["contextual_embedding"] = True
+                                else:
+                                    contextual_contents.append(batch_contents[i])
+                        except Exception as e:
+                            logger.error(f"Contextual embedding failed for batch, using original content: {e}")
+                            contextual_contents = batch_contents
                     else:
-                        contextual_contents.append(batch_contents[i])
-            else:
-                contextual_contents = batch_contents
+                        contextual_contents = batch_contents
 
-                # Vector embeddings for the (possibly contextualised) contents
-                try:
-                    batch_embeddings = create_embeddings_batch(contextual_contents)
-                except EmbeddingError as e:
-                    logger.error("Failed to create embeddings: %s", e)
-                    raise
+                    # Vector embeddings
+                    try:
+                        batch_embeddings = create_embeddings_batch(contextual_contents)
+                    except EmbeddingError as e:
+                        logger.error(f"Vector embedding failed for batch, skipping batch: {e}")
+                        continue  # Skip this batch
 
-                batch_data = []
-                for i, embedding in enumerate(batch_embeddings):
-                    parsed_url = urlparse(batch_urls[i])
-                    source_id = parsed_url.netloc or parsed_url.path
-                    owner_id = db_config.default_owner_id
-                    chunk_size = len(contextual_contents[i])
-
-                    metadata_json = json.dumps({
-                        "chunk_size": chunk_size,
-                        **batch_metadatas[i],
-                    })
-
-                    batch_data.append(
-                        (
-                            batch_urls[i],
-                            batch_chunk_numbers[i],
-                            batch_contents[i],  # store original content
-                            metadata_json,
-                            source_id,
-                            owner_id,
-                            json.dumps(embedding),
+                    # Prepare data for insertion
+                    batch_data = []
+                    for i, embedding in enumerate(batch_embeddings):
+                        parsed_url = urlparse(batch_urls[i])
+                        source_id = parsed_url.netloc or parsed_url.path
+                        owner_id = db_config.default_owner_id
+                        chunk_size = len(contextual_contents[i])
+                        metadata_json = json.dumps({"chunk_size": chunk_size, **batch_metadatas[i]})
+                        batch_data.append(
+                            (
+                                batch_urls[i], batch_chunk_numbers[i], batch_contents[i],
+                                metadata_json, source_id, owner_id, json.dumps(embedding),
+                            )
                         )
-                    )
 
-                await connection.executemany(
-                    """
-                    INSERT INTO crawled_pages (url, chunk_number, content, metadata, source_id, owner_id, embedding)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
-                    """,
-                    batch_data,
-                )
+                    # Insert data
+                    try:
+                        await connection.executemany(
+                            """
+                            INSERT INTO crawled_pages (url, chunk_number, content, metadata, source_id, owner_id, embedding)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                            """,
+                            batch_data,
+                        )
+                        total_processed += len(batch_data)
+                        logger.debug("Successfully inserted batch of %s records", len(batch_data))
+                    except Exception as e:
+                        logger.error(f"Database insertion failed for batch, skipping batch: {e}")
+                        continue # Skip this batch
+                
+                logger.info("Successfully inserted %s documents into database", total_processed)
 
-                total_processed += len(batch_data)
-                logger.debug("Inserted batch of %s records", len(batch_data))
+            except Exception as e:
+                logger.error("Major error during document insertion transaction: %s", e)
+                # The transaction will be rolled back automatically by the `async with` block
+                raise
 
-            logger.info("Successfully inserted %s documents into database", total_processed)
-        except Exception as e:
-            logger.error("Error during document insertion: %s", e)
-            raise
+    if total_processed == 0 and len(contents) > 0:
+        logger.error("CRITICAL: Failed to insert any documents. All batches failed.")
 
 async def search_documents(
     pool: asyncpg.Pool,

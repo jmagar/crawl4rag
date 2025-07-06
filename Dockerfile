@@ -1,8 +1,8 @@
 FROM python:3.12-slim
 
 ARG PORT=8051
-ARG USER_ID=1000
-ARG GROUP_ID=1000
+ARG USER_ID=99
+ARG GROUP_ID=100
 
 WORKDIR /app
 
@@ -31,33 +31,35 @@ RUN apt-get update && \
         libpango-1.0-0 && \
     rm -rf /var/lib/apt/lists/*
 
-# Create non-root user with force flags for rebuild safety
-RUN groupadd -f -g ${GROUP_ID} appuser && \
-    useradd -r -u ${USER_ID} -g appuser -d /app -s /sbin/nologin \
-    -c "Docker image user" appuser || true
+# Create non-root user and group
+RUN (getent group ${GROUP_ID} || groupadd -g ${GROUP_ID} appgroup) && \
+    useradd -u ${USER_ID} -g ${GROUP_ID} -d /app -s /sbin/nologin -c "Docker image user" appuser
 
-# Install uv as root first
+# Set up Playwright browser path
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+# Install uv as root temporarily
 RUN pip install uv
 
-# Copy the MCP server files and set ownership
-COPY --chown=appuser:appuser . .
+# Copy only the dependency and metadata files first to leverage Docker cache
+COPY pyproject.toml README.md ./
 
-# Create directories that crawl4ai needs and set permissions
-RUN mkdir -p /app/.crawl4ai && \
-    chown -R appuser:appuser /app/.crawl4ai
-
-# Create cache directory for Playwright
-RUN mkdir -p /app/.cache && \
-    chown -R appuser:appuser /app/.cache
-
-# Install packages directly to the system (no virtual environment)
-# Combining commands to reduce Docker layers
+# Install Python packages. This is a cached layer.
 RUN uv pip install --system -e .
 
-# Change to non-root user
+# Copy the rest of the application files.
+COPY . .
+
+# Set up the application directory and all necessary cache directories with correct permissions
+# This prevents all filesystem permission errors for subsequent steps.
+RUN mkdir -p /app/.crawl4ai ${PLAYWRIGHT_BROWSERS_PATH} && \
+    chown -R appuser:${GROUP_ID} /app ${PLAYWRIGHT_BROWSERS_PATH}
+
+# Switch to the non-root user
 USER appuser
 
-# Install Playwright browsers as appuser
+# Now, install Playwright browsers as the correct user.
+# The cache directory is already created with the correct permissions.
 RUN playwright install chromium
 
 # Create health check endpoint
