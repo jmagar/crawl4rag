@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, cast
-from urllib.parse import urlparse, urldefrag
+from urllib.parse import urlparse, urldefrag, urljoin
 from xml.etree import ElementTree
 from dotenv import load_dotenv
 import asyncpg
@@ -2235,9 +2235,25 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
 
             if getattr(result_any, 'success', False) and getattr(result_any, 'markdown', None):
                 results_all.append({'url': cast(Any, result_any).url, 'markdown': cast(Any, result_any).markdown})  # type: ignore[attr-defined]
+                # Resolve and validate internal links before enqueueing them for the next depth level
                 for link in getattr(result_any, 'links', {}).get("internal", []):  # type: ignore[attr-defined]
-                    next_url = normalize_url(link.get("href"))
-                    if next_url not in visited:
+                    raw_href: str = link.get("href", "")
+
+                    # Resolve relative URLs against the current page URL to obtain an absolute URL
+                    resolved_href = urljoin(cast(Any, result_any).url, raw_href)
+
+                    # Normalise (remove fragments) and validate the URL
+                    next_url = normalize_url(resolved_href)
+
+                    # Only follow links that stay on the **same origin** as the start page to avoid external crawls
+                    try:
+                        if urlparse(next_url).netloc != urlparse(cast(Any, result_any).url).netloc:
+                            continue  # Skip external domains
+                    except Exception:
+                        continue  # Skip malformed URLs
+
+                    # Enqueue the URL for the next crawl depth if we haven't visited it yet
+                    if next_url and next_url not in visited:
                         next_level_urls.add(next_url)
 
         current_urls = next_level_urls
