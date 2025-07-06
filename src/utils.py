@@ -8,7 +8,6 @@ from typing import List, Dict, Any, Optional, Tuple
 import json
 import asyncpg
 from urllib.parse import urlparse
-import openai
 from openai import AsyncOpenAI, OpenAI
 import time
 import logging
@@ -22,6 +21,11 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 # Configuration validation and management
 # -----------------------------------------------------------------------------
+
+# OpenAI clients will be initialized after configuration is loaded
+embedding_client: OpenAI
+async_openai_client: AsyncOpenAI
+contextual_semaphore: asyncio.Semaphore
 
 @dataclass
 class DatabaseConfig:
@@ -96,6 +100,11 @@ class OpenAIConfig:
     contextual_model: str
     max_retries: int = 3
     retry_delay: float = 1.0
+    # New contextual embedding optimization settings
+    contextual_concurrency_limit: int = 10
+    contextual_requests_per_minute: int = 3000
+    contextual_max_tokens: int = 75
+    contextual_document_limit: int = 15000
     
     @classmethod
     def from_env(cls) -> 'OpenAIConfig':
@@ -114,12 +123,15 @@ class OpenAIConfig:
             embedding_model=os.getenv("EMBEDDING_MODEL", "text-embedding-bge-m3"),
             contextual_model=os.getenv("CONTEXTUAL_MODEL", "gpt-4o-mini"),
             max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "3")),
-            retry_delay=float(os.getenv("OPENAI_RETRY_DELAY", "1.0"))
+            retry_delay=float(os.getenv("OPENAI_RETRY_DELAY", "1.0")),
+            contextual_concurrency_limit=int(os.getenv("CONTEXTUAL_CONCURRENCY_LIMIT", "10")),
+            contextual_requests_per_minute=int(os.getenv("CONTEXTUAL_REQUESTS_PER_MINUTE", "3000")),
+            contextual_max_tokens=int(os.getenv("CONTEXTUAL_MAX_TOKENS", "75")),
+            contextual_document_limit=int(os.getenv("CONTEXTUAL_DOCUMENT_LIMIT", "15000"))
         )
 
 
-
-# Global configuration instances
+# Initialize global configuration
 try:
     db_config = DatabaseConfig.from_env()
     openai_config = OpenAIConfig.from_env()
@@ -127,18 +139,19 @@ except Exception as e:
     logger.error(f"Configuration error: {e}")
     raise
 
-# -----------------------------------------------------------------------------
-# OpenAI client configuration
-# -----------------------------------------------------------------------------
-
+# Initialize OpenAI clients after configuration is loaded
 # Dedicated client for embeddings
 embedding_client = OpenAI(api_key=openai_config.api_key, base_url=openai_config.embedding_url)
 
 # Async client for contextual embeddings
 async_openai_client = AsyncOpenAI(api_key=openai_config.api_key)
 
-# Set default client for backwards compatibility
-openai.api_key = openai_config.api_key
+# Create semaphore for contextual embeddings concurrency control
+contextual_semaphore = asyncio.Semaphore(openai_config.contextual_concurrency_limit)
+
+logger.info(f"Configured OpenAI clients - Embedding: {openai_config.embedding_model}, "
+            f"Contextual: {openai_config.contextual_model}, "
+            f"Concurrency limit: {openai_config.contextual_concurrency_limit}")
 
 # Global connection pool (will be initialized once)
 _db_pool: Optional[asyncpg.Pool] = None
@@ -284,7 +297,7 @@ def create_embedding(text: str) -> List[float]:
 async def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, bool]:
     """
     Generate contextual information for a chunk within a document to improve retrieval.
-    Uses async OpenAI client to avoid blocking.
+    Uses async OpenAI client with optimized settings for better performance.
     
     Args:
         full_document: The complete document text
@@ -296,34 +309,36 @@ async def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple
         - Boolean indicating if contextual embedding was performed
     """
     try:
-        # Create the prompt for generating contextual information
-        prompt = f"""<document> 
-{full_document[:25000]} 
+        # Use semaphore to limit concurrent API calls
+        async with contextual_semaphore:
+            # Create the prompt with reduced document size for faster processing
+            prompt = f"""<document> 
+{full_document[:openai_config.contextual_document_limit]} 
 </document>
 Here is the chunk we want to situate within the whole document 
 <chunk> 
 {chunk}
 </chunk> 
-Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else."""
+Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else. Keep it under 50 words."""
 
-        # Call the OpenAI API to generate contextual information using async client
-        response = await async_openai_client.chat.completions.create(
-            model=openai_config.contextual_model,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=200
-        )
-        
-        # Extract the generated context
-        context = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
-        
-        # Combine the context with the original chunk
-        contextual_text = f"{context}\n---\n{chunk}"
-        
-        return contextual_text, True
+            # Call the OpenAI API with reduced token limits for faster responses
+            response = await async_openai_client.chat.completions.create(
+                model=openai_config.contextual_model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that provides concise contextual information in 50 words or less."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=openai_config.contextual_max_tokens  # Reduced from 200 to 75
+            )
+            
+            # Extract the generated context
+            context = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
+            
+            # Combine the context with the original chunk
+            contextual_text = f"{context}\n---\n{chunk}"
+            
+            return contextual_text, True
     
     except Exception as e:
         logger.warning(f"Error generating contextual embedding: {e}. Using original chunk instead.")
