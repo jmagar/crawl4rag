@@ -8,7 +8,6 @@ from typing import List, Dict, Any, Optional, Tuple
 import json
 import asyncpg
 from urllib.parse import urlparse
-import openai
 from openai import AsyncOpenAI, OpenAI
 import time
 import logging
@@ -22,6 +21,10 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 # Configuration validation and management
 # -----------------------------------------------------------------------------
+
+# OpenAI clients will be initialized after configuration is loaded
+embedding_client: OpenAI
+async_openai_client: AsyncOpenAI
 
 @dataclass
 class DatabaseConfig:
@@ -96,6 +99,13 @@ class OpenAIConfig:
     contextual_model: str
     max_retries: int = 3
     retry_delay: float = 1.0
+    # Contextual embedding optimization settings
+    contextual_max_tokens: int = 75
+    contextual_document_limit: int = 15000
+    # Intelligent batching configuration
+    openai_tier: int = 2
+    use_intelligent_batching: bool = True
+    contextual_batch_size_override: Optional[int] = None
     
     @classmethod
     def from_env(cls) -> 'OpenAIConfig':
@@ -114,12 +124,16 @@ class OpenAIConfig:
             embedding_model=os.getenv("EMBEDDING_MODEL", "text-embedding-bge-m3"),
             contextual_model=os.getenv("CONTEXTUAL_MODEL", "gpt-4o-mini"),
             max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "3")),
-            retry_delay=float(os.getenv("OPENAI_RETRY_DELAY", "1.0"))
+            retry_delay=float(os.getenv("OPENAI_RETRY_DELAY", "1.0")),
+            contextual_max_tokens=int(os.getenv("CONTEXTUAL_MAX_TOKENS", "75")),
+            contextual_document_limit=int(os.getenv("CONTEXTUAL_DOCUMENT_LIMIT", "15000")),
+            openai_tier=int(os.getenv("OPENAI_TIER", "2")),
+            use_intelligent_batching=os.getenv("USE_INTELLIGENT_BATCHING", "true") == "true",
+            contextual_batch_size_override=int(os.getenv("CONTEXTUAL_BATCH_SIZE_OVERRIDE", "0")) or None
         )
 
 
-
-# Global configuration instances
+# Initialize global configuration
 try:
     db_config = DatabaseConfig.from_env()
     openai_config = OpenAIConfig.from_env()
@@ -127,18 +141,17 @@ except Exception as e:
     logger.error(f"Configuration error: {e}")
     raise
 
-# -----------------------------------------------------------------------------
-# OpenAI client configuration
-# -----------------------------------------------------------------------------
-
+# Initialize OpenAI clients after configuration is loaded
 # Dedicated client for embeddings
 embedding_client = OpenAI(api_key=openai_config.api_key, base_url=openai_config.embedding_url)
 
 # Async client for contextual embeddings
 async_openai_client = AsyncOpenAI(api_key=openai_config.api_key)
 
-# Set default client for backwards compatibility
-openai.api_key = openai_config.api_key
+logger.info(f"Configured OpenAI clients - Embedding: {openai_config.embedding_model}, "
+            f"Contextual: {openai_config.contextual_model}, "
+            f"Tier: {openai_config.openai_tier}, "
+            f"Intelligent Batching: {openai_config.use_intelligent_batching}")
 
 # Global connection pool (will be initialized once)
 _db_pool: Optional[asyncpg.Pool] = None
@@ -284,7 +297,7 @@ def create_embedding(text: str) -> List[float]:
 async def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, bool]:
     """
     Generate contextual information for a chunk within a document to improve retrieval.
-    Uses async OpenAI client to avoid blocking.
+    Uses async OpenAI client with optimized settings for better performance.
     
     Args:
         full_document: The complete document text
@@ -296,25 +309,25 @@ async def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple
         - Boolean indicating if contextual embedding was performed
     """
     try:
-        # Create the prompt for generating contextual information
+        # Create the prompt with reduced document size for faster processing
         prompt = f"""<document> 
-{full_document[:25000]} 
+{full_document[:openai_config.contextual_document_limit]} 
 </document>
 Here is the chunk we want to situate within the whole document 
 <chunk> 
 {chunk}
 </chunk> 
-Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else."""
+Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else. Keep it under 50 words."""
 
-        # Call the OpenAI API to generate contextual information using async client
+        # Call the OpenAI API with reduced token limits for faster responses
         response = await async_openai_client.chat.completions.create(
             model=openai_config.contextual_model,
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
+                {"role": "system", "content": "You are a helpful assistant that provides concise contextual information in 50 words or less."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3,
-            max_tokens=200
+            max_tokens=openai_config.contextual_max_tokens  # Reduced from 200 to 75
         )
         
         # Extract the generated context
@@ -343,6 +356,175 @@ async def process_chunk_with_context(args: Tuple[str, str, str]) -> Tuple[str, b
     """
     url, content, full_document = args
     return await generate_contextual_embedding(full_document, content)
+
+def calculate_optimal_batch_size(tier: int, avg_chunk_size: int = 500) -> dict:
+    """Calculate optimal batch sizes based on OpenAI tier limits."""
+    
+    tier_limits = {
+        1: {"rpm": 500, "tpm": 30000},
+        2: {"rpm": 5000, "tpm": 450000}, 
+        3: {"rpm": 5000, "tpm": 800000},
+        4: {"rpm": 10000, "tpm": 2000000},
+        5: {"rpm": 10000, "tpm": 4000000}
+    }
+    
+    limits = tier_limits.get(tier, tier_limits[1])
+    
+    # Estimate tokens per contextual request
+    # Document context (15k chars ≈ 3750 tokens) + chunk (500 chars ≈ 125 tokens) + response (75 tokens)
+    tokens_per_request = 3750 + 125 + 75  # ≈ 3950 tokens
+    
+    # Calculate max requests based on token limits
+    max_requests_by_tokens = limits["tpm"] // tokens_per_request
+    max_requests_by_rpm = limits["rpm"]
+    
+    # Use the more restrictive limit
+    max_concurrent_requests = min(max_requests_by_tokens, max_requests_by_rpm)
+    
+    # For batching: estimate how many chunks can fit in one API call
+    # Conservative estimate: 8000 tokens for document + chunks + responses
+    tokens_per_chunk_in_batch = 200  # chunk + small context
+    max_chunks_per_batch = min(8000 // tokens_per_chunk_in_batch, 10)  # Cap at 10 for reliability
+    
+    return {
+        "tier": tier,
+        "max_concurrent_requests": max_concurrent_requests,
+        "max_chunks_per_batch": max_chunks_per_batch,
+        "estimated_speedup": f"{max_chunks_per_batch}x",
+        "rpm_limit": limits["rpm"],
+        "tpm_limit": limits["tpm"]
+    }
+
+async def generate_contextual_embeddings_batch(
+    full_document: str, 
+    chunks: List[str],
+    tier: int = 2
+) -> List[Tuple[str, bool]]:
+    """
+    Generate contextual embeddings using intelligent batching based on OpenAI tier limits.
+    """
+    if not openai_config.use_intelligent_batching:
+        # Fall back to individual processing
+        return await _fallback_individual_context(full_document, chunks)
+    
+    config = calculate_optimal_batch_size(tier)
+    
+    # Use override if specified, otherwise use calculated batch size
+    batch_size = openai_config.contextual_batch_size_override or config["max_chunks_per_batch"]
+    max_concurrent = min(config["max_concurrent_requests"], 20)  # Safety cap
+    
+    logger.info(f"Processing {len(chunks)} chunks with Tier {tier} limits: "
+                f"batch_size={batch_size}, max_concurrent={max_concurrent}")
+    
+    # Split chunks into batches
+    batches = [chunks[i:i + batch_size] for i in range(0, len(chunks), batch_size)]
+    
+    # Create semaphore for concurrency control
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def process_batch(batch_chunks: List[str]) -> List[Tuple[str, bool]]:
+        async with semaphore:
+            return await _generate_multi_chunk_context(full_document, batch_chunks)
+    
+    # Process all batches concurrently
+    tasks = [process_batch(batch) for batch in batches]
+    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Flatten results
+    results = []
+    for batch_idx, batch_result in enumerate(batch_results):
+        if isinstance(batch_result, Exception):
+            logger.error(f"Batch {batch_idx} failed: {batch_result}")
+            # Add fallback results for failed batch
+            batch_chunks = batches[batch_idx]
+            results.extend([(chunk, False) for chunk in batch_chunks])
+        else:
+            results.extend(batch_result)
+    
+    return results
+
+async def _generate_multi_chunk_context(
+    full_document: str, 
+    chunks: List[str]
+) -> List[Tuple[str, bool]]:
+    """Generate context for multiple chunks in a single API call."""
+    
+    if len(chunks) == 1:
+        # Single chunk - use existing optimized function
+        return [await generate_contextual_embedding(full_document, chunks[0])]
+    
+    # Multi-chunk batching
+    prompt = f"""<document>
+{full_document[:openai_config.contextual_document_limit]}
+</document>
+
+Provide concise context (max 30 words each) for these chunks:
+
+{chr(10).join([f"CHUNK_{i+1}: {chunk[:300]}..." for i, chunk in enumerate(chunks)])}
+
+Respond with exactly {len(chunks)} lines, each starting with "CHUNK_X:" followed by the context."""
+
+    try:
+        response = await async_openai_client.chat.completions.create(
+            model=openai_config.contextual_model,
+            messages=[
+                {"role": "system", "content": "Provide concise context for each chunk. Format: 'CHUNK_X: [context]'"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=min(len(chunks) * 50, 500)  # Scale with chunk count
+        )
+        
+        content = response.choices[0].message.content.strip()
+        lines = content.split('\n')
+        
+        # Parse responses
+        contexts = []
+        for i, line in enumerate(lines):
+            if f"CHUNK_{i+1}:" in line:
+                context = line.split(f"CHUNK_{i+1}:", 1)[1].strip()
+                contexts.append(context)
+            else:
+                contexts.append(f"Context for chunk {i+1}")  # Fallback
+        
+        # Ensure we have the right number of contexts
+        while len(contexts) < len(chunks):
+            contexts.append(f"Context for chunk {len(contexts)+1}")
+        
+        # Combine contexts with chunks
+        results = []
+        for i, chunk in enumerate(chunks):
+            context = contexts[i] if i < len(contexts) else f"Context for chunk {i+1}"
+            contextual_text = f"{context}\n---\n{chunk}"
+            results.append((contextual_text, True))
+        
+        logger.debug(f"Successfully processed batch of {len(chunks)} chunks")
+        return results
+        
+    except Exception as e:
+        logger.warning(f"Batch context generation failed: {e}")
+        # Fallback to individual processing
+        return await _fallback_individual_context(full_document, chunks)
+
+async def _fallback_individual_context(
+    full_document: str, 
+    chunks: List[str]
+) -> List[Tuple[str, bool]]:
+    """Fallback to individual processing if batch fails."""
+    logger.info(f"Falling back to individual processing for {len(chunks)} chunks")
+    
+    tasks = [generate_contextual_embedding(full_document, chunk) for chunk in chunks]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    final_results = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            logger.warning(f"Individual context generation failed: {result}")
+            final_results.append((chunks[i], False))  # Use original chunk
+        else:
+            final_results.append(result)
+    
+    return final_results
 
 async def add_documents_to_db(
     pool: asyncpg.Pool,
@@ -380,33 +562,41 @@ async def add_documents_to_db(
                 batch_contents = contents[start:end]
                 batch_metadatas = [meta.copy() for meta in metadatas[start:end]]
 
-                # Contextual embedding (optional)
-                if use_contextual_embeddings:
-                    tasks = [
-                        process_chunk_with_context(
-                            (
-                                batch_urls[i],
-                                batch_contents[i],
-                                url_to_full_document.get(batch_urls[i], ""),
-                            )
-                        )
-                        for i in range(len(batch_contents))
-                    ]
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    contextual_contents: List[str] = []
-                    for i, result in enumerate(results):
-                        if isinstance(result, Exception):
-                            logger.warning(
-                                "Contextual embedding failed for chunk %s: %s", i, result
-                            )
-                            contextual_contents.append(batch_contents[i])
-                        else:
-                            contextual_text, success = result
-                            contextual_contents.append(contextual_text)
-                            if success:
-                                batch_metadatas[i]["contextual_embedding"] = True
-                else:
-                    contextual_contents = batch_contents
+                            # Contextual embedding (optional) - now with intelligent batching
+            if use_contextual_embeddings:
+                # Group chunks by document to enable better batching
+                doc_to_chunks = {}
+                for i, (url, content) in enumerate(zip(batch_urls, batch_contents)):
+                    full_doc = url_to_full_document.get(url, "")
+                    if full_doc not in doc_to_chunks:
+                        doc_to_chunks[full_doc] = []
+                    doc_to_chunks[full_doc].append((i, content))
+                
+                # Process each document's chunks using intelligent batching
+                all_results: List[Optional[Tuple[str, bool]]] = [None] * len(batch_contents)
+                
+                for full_doc, chunks_with_indices in doc_to_chunks.items():
+                    indices, chunks = zip(*chunks_with_indices)
+                    
+                    # Use intelligent batching based on OpenAI tier
+                    contextual_results = await generate_contextual_embeddings_batch(
+                        full_doc, list(chunks), openai_config.openai_tier
+                    )
+                    
+                    # Map results back to original positions
+                    for idx, result in zip(indices, contextual_results):
+                        all_results[idx] = result
+                
+                # Build contextual_contents from results
+                contextual_contents: List[str] = []
+                for i, result in enumerate(all_results):
+                    if result and result[1]:  # Successfully generated context
+                        contextual_contents.append(result[0])
+                        batch_metadatas[i]["contextual_embedding"] = True
+                    else:
+                        contextual_contents.append(batch_contents[i])
+            else:
+                contextual_contents = batch_contents
 
                 # Vector embeddings for the (possibly contextualised) contents
                 try:
