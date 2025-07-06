@@ -80,20 +80,36 @@ The server provides essential web crawling and search tools:
 
 The recommended way to run the server is with Docker Compose, which orchestrates the MCP server, PostgreSQL database, and Neo4j.
 
+> **🔒 Security Note**: This version includes important security improvements including Docker secrets management, database access controls, and non-root container execution. See [FIXES_IMPLEMENTED.md](FIXES_IMPLEMENTED.md) for complete details.
+
 1.  **Clone the repository:**
     ```bash
     git clone https://github.com/coleam00/mcp-crawl4ai-rag.git
     cd mcp-crawl4ai-rag
     ```
 
-2.  **Create and configure your `.env` file:**
+2.  **Create and configure your secrets (Recommended for Production):**
+    ```bash
+    # Create secrets directory
+    mkdir -p secrets
+    
+    # Set your credentials (use strong passwords for production)
+    echo "your_postgres_username" > secrets/postgres_user.txt
+    echo "your_secure_postgres_password" > secrets/postgres_password.txt
+    echo "your_secure_neo4j_password" > secrets/neo4j_password.txt
+    
+    # Secure the secrets directory
+    chmod 600 secrets/*.txt
+    ```
+
+3.  **Create and configure your `.env` file:**
     Create a `.env` file in the project root by copying the example:
     ```bash
     cp .env.example .env
     ```
-    Now, edit the `.env` file and fill in your `OPENAI_API_KEY` and your desired `NEO4J_PASSWORD`. The PostgreSQL variables are pre-configured for the Docker environment.
+    Now, edit the `.env` file and fill in your `OPENAI_API_KEY`. For production deployments, avoid putting passwords in the `.env` file and use the secrets method above.
 
-3.  **Run with Docker Compose:**
+4.  **Run with Docker Compose:**
     ```bash
     docker-compose up --build
     ```
@@ -128,17 +144,33 @@ USE_AGENTIC_RAG=false
 USE_RERANKING=false
 USE_KNOWLEDGE_GRAPH=false
 
-# PostgreSQL Configuration
+# Database Configuration (Docker secrets recommended for production)
 POSTGRES_HOST=localhost
 POSTGRES_PORT=5432
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=postgres
+POSTGRES_USER=CHANGEME
+POSTGRES_PASSWORD=CHANGEME
 POSTGRES_DB=crawl4rag
+
+# Database Performance Tuning
+DB_MIN_CONNECTIONS=5
+DB_MAX_CONNECTIONS=20
+
+# OpenAI Configuration
+OPENAI_MAX_RETRIES=3
+OPENAI_RETRY_DELAY=1.0
+
+# Performance Tuning
+CODE_PROCESSING_BATCH_SIZE=5
 
 # Neo4j Configuration (required for knowledge graph functionality)
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
-NEO4J_PASSWORD=your_neo4j_password
+NEO4J_PASSWORD=CHANGEME
+
+# For production with Docker secrets, use these instead:
+# POSTGRES_USER_FILE=/run/secrets/postgres_user
+# POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password
+# NEO4J_PASSWORD_FILE=/run/secrets/neo4j_password
 ```
 
 ### RAG Strategy Options
@@ -297,8 +329,11 @@ Add this server to your MCP configuration for Claude Desktop, Windsurf, or any o
       "env": {
         "TRANSPORT": "stdio",
         "OPENAI_API_KEY": "your_openai_api_key",
-        "SUPABASE_URL": "your_supabase_url",
-        "SUPABASE_SERVICE_KEY": "your_supabase_service_key",
+        "POSTGRES_HOST": "localhost",
+        "POSTGRES_PORT": "5432", 
+        "POSTGRES_USER": "postgres",
+        "POSTGRES_PASSWORD": "postgres",
+        "POSTGRES_DB": "crawl4rag",
         "USE_KNOWLEDGE_GRAPH": "false",
         "NEO4J_URI": "bolt://localhost:7687",
         "NEO4J_USER": "neo4j",
@@ -319,8 +354,11 @@ Add this server to your MCP configuration for Claude Desktop, Windsurf, or any o
       "args": ["run", "--rm", "-i", 
                "-e", "TRANSPORT", 
                "-e", "OPENAI_API_KEY", 
-               "-e", "SUPABASE_URL", 
-               "-e", "SUPABASE_SERVICE_KEY",
+               "-e", "POSTGRES_HOST",
+               "-e", "POSTGRES_PORT",
+               "-e", "POSTGRES_USER",
+               "-e", "POSTGRES_PASSWORD",
+               "-e", "POSTGRES_DB",
                "-e", "USE_KNOWLEDGE_GRAPH",
                "-e", "NEO4J_URI",
                "-e", "NEO4J_USER",
@@ -329,8 +367,11 @@ Add this server to your MCP configuration for Claude Desktop, Windsurf, or any o
       "env": {
         "TRANSPORT": "stdio",
         "OPENAI_API_KEY": "your_openai_api_key",
-        "SUPABASE_URL": "your_supabase_url",
-        "SUPABASE_SERVICE_KEY": "your_supabase_service_key",
+        "POSTGRES_HOST": "localhost",
+        "POSTGRES_PORT": "5432",
+        "POSTGRES_USER": "postgres", 
+        "POSTGRES_PASSWORD": "postgres",
+        "POSTGRES_DB": "crawl4rag",
         "USE_KNOWLEDGE_GRAPH": "false",
         "NEO4J_URI": "bolt://localhost:7687",
         "NEO4J_USER": "neo4j",
@@ -378,6 +419,22 @@ The Neo4j database stores code structure as:
 2. **Code Validation**: Use `check_ai_script_hallucinations` tool to validate AI-generated Python scripts
 3. **Knowledge Exploration**: Use `query_knowledge_graph` tool to explore available repositories, classes, and methods
 
+## Security Considerations
+
+> **🔒 Important**: This version includes significant security improvements:
+> - Docker secrets for credential management
+> - Database Row Level Security (RLS) with proper authorization
+> - Non-root container execution
+> - Input validation and parameterized queries
+> - Comprehensive error handling and logging
+
+For production deployments:
+- Always use Docker secrets for credentials
+- Configure proper network security policies
+- Implement API rate limiting
+- Regular security scanning and updates
+- Monitor logs for suspicious activity
+
 ## Building Your Own Server
 
 This implementation provides a foundation for building more complex MCP servers with web crawling capabilities. To build your own:
@@ -386,3 +443,29 @@ This implementation provides a foundation for building more complex MCP servers 
 2. Create your own lifespan function to add your own dependencies
 3. Modify the `utils.py` file for any helper functions you need
 4. Extend the crawling capabilities by adding more specialized crawlers
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Database Connection Errors**: Ensure PostgreSQL is running and credentials are correct
+2. **Neo4j Connection Issues**: Verify Neo4j is running and accessible at the configured URI
+3. **OpenAI API Errors**: Check your API key and rate limits
+4. **Docker Permission Issues**: Ensure proper file permissions for secrets directory
+
+### Logs and Monitoring
+
+The system now includes comprehensive structured logging. Check Docker logs for detailed error information:
+
+```bash
+docker-compose logs crawl4rag
+```
+
+## Performance Tuning
+
+For large-scale deployments, consider:
+
+- Adjusting `DB_MIN_CONNECTIONS` and `DB_MAX_CONNECTIONS` based on load
+- Tuning `CODE_PROCESSING_BATCH_SIZE` for memory usage optimization
+- Configuring `OPENAI_MAX_RETRIES` and `OPENAI_RETRY_DELAY` for reliability
+- Using dedicated database instances for production workloads

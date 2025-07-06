@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   crawl4rag:
     labels:
@@ -7,7 +9,7 @@ services:
       dockerfile: Dockerfile
     container_name: crawl4rag
     ports:
-      - "${PORT}:${PORT}"
+      - "${PORT:-8051}:${PORT:-8051}"
     env_file:
       - .env
     environment:
@@ -20,7 +22,7 @@ services:
         condition: service_started
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:${PORT:-8051}/messages', timeout=5)"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${PORT:-8051}/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -30,16 +32,16 @@ services:
     image: pgvector/pgvector:pg16
     container_name: crawl4rag-db
     environment:
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER:-crawl4rag}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-crawl4rag}
+      - POSTGRES_DB=${POSTGRES_DB:-crawl4rag}
     volumes:
-      - /mnt/cache/appdata/crawl4rag-db:/var/lib/postgresql/data
+      - crawl4rag_db_data:/var/lib/postgresql/data
       - ./crawled_pages.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
       - "5332:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-crawl4rag} -d ${POSTGRES_DB:-crawl4rag}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -49,10 +51,18 @@ services:
     container_name: crawl4rag-neo4j
     restart: unless-stopped
     environment:
-      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD}
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-crawl4rag}
       - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_dbms_security_procedures_allowlist=apoc.*
     ports:
       - "7474:7474"
       - "7687:7687"
     volumes:
-      - /mnt/cache/appdata/crawl4rag-neo4j:/data
+      - crawl4rag_neo4j_data:/data
+
+volumes:
+  crawl4rag_db_data:
+    driver: local
+  crawl4rag_neo4j_data:
+    driver: local
