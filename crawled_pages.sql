@@ -35,7 +35,7 @@ create table crawled_pages (
     metadata jsonb not null default '{}'::jsonb,
     source_id text not null,
     owner_id text not null default current_user,
-    embedding vector(1024),  -- OpenAI embeddings are 1024 dimensions
+    embedding vector(1024),  -- Normalized to 1024 dimensions for optimization
     created_at timestamp with time zone default timezone('utc'::text, now()) not null,
     
     -- Add a unique constraint to prevent duplicate chunks for the same URL
@@ -138,7 +138,7 @@ create table code_examples (
     metadata jsonb not null default '{}'::jsonb,
     source_id text not null,
     owner_id text not null default current_user,
-    embedding vector(1024),  -- OpenAI embeddings are 1024 dimensions
+    embedding vector(1024),  -- Normalized to 1024 dimensions for optimization
     created_at timestamp with time zone default timezone('utc'::text, now()) not null,
     
     -- Add a unique constraint to prevent duplicate chunks for the same URL

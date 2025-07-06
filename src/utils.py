@@ -206,6 +206,16 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     if not texts:
         return []
     
+    # Ensure each embedding matches DB vector dimension (1024)
+    target_dim = 1024
+    def _fix_dim(vec: List[float]) -> List[float]:
+        if len(vec) == target_dim:
+            return vec
+        if len(vec) > target_dim:
+            return vec[:target_dim]
+        # pad with zeros
+        return vec + [0.0] * (target_dim - len(vec))
+    
     for retry in range(openai_config.max_retries):
         try:
             logger.debug(f"Creating embeddings for {len(texts)} texts (attempt {retry + 1})")
@@ -213,16 +223,6 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
                 model=openai_config.embedding_model,
                 input=texts
             )
-
-            # Ensure each embedding matches DB vector dimension (1024)
-            target_dim = 1024
-            def _fix_dim(vec: List[float]) -> List[float]:
-                if len(vec) == target_dim:
-                    return vec
-                if len(vec) > target_dim:
-                    return vec[:target_dim]
-                # pad with zeros
-                return vec + [0.0] * (target_dim - len(vec))
 
             embeddings_batch = [_fix_dim(d.embedding) for d in response.data]
             embeddings = embeddings_batch
@@ -362,99 +362,98 @@ async def add_documents_to_db(
     use_contextual_embeddings = os.getenv("USE_CONTEXTUAL_EMBEDDINGS", "false") == "true"
     logger.info("Using contextual embeddings: %s", use_contextual_embeddings)
 
-    async with pool.acquire() as connection:
-        async with connection.transaction():
-            try:
-                if unique_urls:
-                    await connection.execute(
-                        "DELETE FROM crawled_pages WHERE url = ANY($1)", unique_urls
-                    )
-                    logger.info("Deleted existing records for %s URLs", len(unique_urls))
+    async with pool.acquire() as connection, connection.transaction():
+        try:
+            if unique_urls:
+                await connection.execute(
+                    "DELETE FROM crawled_pages WHERE url = ANY($1)", unique_urls
+                )
+                logger.info("Deleted existing records for %s URLs", len(unique_urls))
 
-                total_processed = 0
+            total_processed = 0
 
-                for start in range(0, len(contents), batch_size):
-                    end = min(start + batch_size, len(contents))
+            for start in range(0, len(contents), batch_size):
+                end = min(start + batch_size, len(contents))
 
-                    batch_urls = urls[start:end]
-                    batch_chunk_numbers = chunk_numbers[start:end]
-                    batch_contents = contents[start:end]
-                    batch_metadatas = [meta.copy() for meta in metadatas[start:end]]
+                batch_urls = urls[start:end]
+                batch_chunk_numbers = chunk_numbers[start:end]
+                batch_contents = contents[start:end]
+                batch_metadatas = [meta.copy() for meta in metadatas[start:end]]
 
-                    # Contextual embedding (optional)
-                    if use_contextual_embeddings:
-                        tasks = [
-                            process_chunk_with_context(
-                                (
-                                    batch_urls[i],
-                                    batch_contents[i],
-                                    url_to_full_document.get(batch_urls[i], ""),
-                                )
-                            )
-                            for i in range(len(batch_contents))
-                        ]
-                        results = await asyncio.gather(*tasks, return_exceptions=True)
-                        contextual_contents: List[str] = []
-                        for i, result in enumerate(results):
-                            if isinstance(result, Exception):
-                                logger.warning(
-                                    "Contextual embedding failed for chunk %s: %s", i, result
-                                )
-                                contextual_contents.append(batch_contents[i])
-                            else:
-                                contextual_text, success = result
-                                contextual_contents.append(contextual_text)
-                                if success:
-                                    batch_metadatas[i]["contextual_embedding"] = True
-                    else:
-                        contextual_contents = batch_contents
-
-                    # Vector embeddings for the (possibly contextualised) contents
-                    try:
-                        batch_embeddings = create_embeddings_batch(contextual_contents)
-                    except EmbeddingError as e:
-                        logger.error("Failed to create embeddings: %s", e)
-                        raise
-
-                    batch_data = []
-                    for i, embedding in enumerate(batch_embeddings):
-                        parsed_url = urlparse(batch_urls[i])
-                        source_id = parsed_url.netloc or parsed_url.path
-                        owner_id = db_config.default_owner_id
-                        chunk_size = len(contextual_contents[i])
-
-                        metadata_json = json.dumps({
-                            "chunk_size": chunk_size,
-                            **batch_metadatas[i],
-                        })
-
-                        batch_data.append(
+                # Contextual embedding (optional)
+                if use_contextual_embeddings:
+                    tasks = [
+                        process_chunk_with_context(
                             (
                                 batch_urls[i],
-                                batch_chunk_numbers[i],
-                                batch_contents[i],  # store original content
-                                metadata_json,
-                                source_id,
-                                owner_id,
-                                json.dumps(embedding),
+                                batch_contents[i],
+                                url_to_full_document.get(batch_urls[i], ""),
                             )
                         )
+                        for i in range(len(batch_contents))
+                    ]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    contextual_contents: List[str] = []
+                    for i, result in enumerate(results):
+                        if isinstance(result, Exception):
+                            logger.warning(
+                                "Contextual embedding failed for chunk %s: %s", i, result
+                            )
+                            contextual_contents.append(batch_contents[i])
+                        else:
+                            contextual_text, success = result
+                            contextual_contents.append(contextual_text)
+                            if success:
+                                batch_metadatas[i]["contextual_embedding"] = True
+                else:
+                    contextual_contents = batch_contents
 
-                    await connection.executemany(
-                        """
-                        INSERT INTO crawled_pages (url, chunk_number, content, metadata, source_id, owner_id, embedding)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7)
-                        """,
-                        batch_data,
+                # Vector embeddings for the (possibly contextualised) contents
+                try:
+                    batch_embeddings = create_embeddings_batch(contextual_contents)
+                except EmbeddingError as e:
+                    logger.error("Failed to create embeddings: %s", e)
+                    raise
+
+                batch_data = []
+                for i, embedding in enumerate(batch_embeddings):
+                    parsed_url = urlparse(batch_urls[i])
+                    source_id = parsed_url.netloc or parsed_url.path
+                    owner_id = db_config.default_owner_id
+                    chunk_size = len(contextual_contents[i])
+
+                    metadata_json = json.dumps({
+                        "chunk_size": chunk_size,
+                        **batch_metadatas[i],
+                    })
+
+                    batch_data.append(
+                        (
+                            batch_urls[i],
+                            batch_chunk_numbers[i],
+                            batch_contents[i],  # store original content
+                            metadata_json,
+                            source_id,
+                            owner_id,
+                            json.dumps(embedding),
+                        )
                     )
 
-                    total_processed += len(batch_data)
-                    logger.debug("Inserted batch of %s records", len(batch_data))
+                await connection.executemany(
+                    """
+                    INSERT INTO crawled_pages (url, chunk_number, content, metadata, source_id, owner_id, embedding)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    """,
+                    batch_data,
+                )
 
-                logger.info("Successfully inserted %s documents into database", total_processed)
-            except Exception as e:
-                logger.error("Error during document insertion: %s", e)
-                raise
+                total_processed += len(batch_data)
+                logger.debug("Inserted batch of %s records", len(batch_data))
+
+            logger.info("Successfully inserted %s documents into database", total_processed)
+        except Exception as e:
+            logger.error("Error during document insertion: %s", e)
+            raise
 
 async def search_documents(
     pool: asyncpg.Pool,
@@ -630,69 +629,68 @@ async def add_code_examples_to_db(
 
     unique_urls = list(set(urls))
 
-    async with pool.acquire() as connection:
-        async with connection.transaction():
-            try:
-                if unique_urls:
-                    await connection.execute(
-                        "DELETE FROM code_examples WHERE url = ANY($1)", unique_urls
-                    )
-                    logger.info(
-                        "Deleted existing code examples for %s URLs", len(unique_urls)
-                    )
-
-                total_processed = 0
-                total_items = len(urls)
-
-                for start in range(0, total_items, batch_size):
-                    end = min(start + batch_size, total_items)
-
-                    batch_texts = [
-                        f"{code_examples[i]}\n\nSummary: {summaries[i]}" for i in range(start, end)
-                    ]
-
-                    try:
-                        embeddings = create_embeddings_batch(batch_texts)
-                    except EmbeddingError as e:
-                        logger.error("Failed to create embeddings for code example batch: %s", e)
-                        raise
-
-                    batch_data = []
-                    for offset, embedding in enumerate(embeddings):
-                        idx = start + offset
-                        parsed_url = urlparse(urls[idx])
-                        source_id = parsed_url.netloc or parsed_url.path
-                        owner_id = db_config.default_owner_id
-
-                        batch_data.append(
-                            (
-                                urls[idx],
-                                chunk_numbers[idx],
-                                code_examples[idx],
-                                summaries[idx],
-                                json.dumps(metadatas[idx]),
-                                source_id,
-                                owner_id,
-                                json.dumps(embedding),
-                            )
-                        )
-
-                    await connection.executemany(
-                        """
-                        INSERT INTO code_examples (url, chunk_number, content, summary, metadata, source_id, owner_id, embedding)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                        """,
-                        batch_data,
-                    )
-                    total_processed += len(batch_data)
-                    logger.debug("Inserted batch of %s code examples", len(batch_data))
-
-                logger.info(
-                    "Successfully inserted %s code examples into database", total_processed
+    async with pool.acquire() as connection, connection.transaction():
+        try:
+            if unique_urls:
+                await connection.execute(
+                    "DELETE FROM code_examples WHERE url = ANY($1)", unique_urls
                 )
-            except Exception as e:
-                logger.error("Error during code examples insertion: %s", e)
-                raise
+                logger.info(
+                    "Deleted existing code examples for %s URLs", len(unique_urls)
+                )
+
+            total_processed = 0
+            total_items = len(urls)
+
+            for start in range(0, total_items, batch_size):
+                end = min(start + batch_size, total_items)
+
+                batch_texts = [
+                    f"{code_examples[i]}\n\nSummary: {summaries[i]}" for i in range(start, end)
+                ]
+
+                try:
+                    embeddings = create_embeddings_batch(batch_texts)
+                except EmbeddingError as e:
+                    logger.error("Failed to create embeddings for code example batch: %s", e)
+                    raise
+
+                batch_data = []
+                for offset, embedding in enumerate(embeddings):
+                    idx = start + offset
+                    parsed_url = urlparse(urls[idx])
+                    source_id = parsed_url.netloc or parsed_url.path
+                    owner_id = db_config.default_owner_id
+
+                    batch_data.append(
+                        (
+                            urls[idx],
+                            chunk_numbers[idx],
+                            code_examples[idx],
+                            summaries[idx],
+                            json.dumps(metadatas[idx]),
+                            source_id,
+                            owner_id,
+                            json.dumps(embedding),
+                        )
+                    )
+
+                await connection.executemany(
+                    """
+                    INSERT INTO code_examples (url, chunk_number, content, summary, metadata, source_id, owner_id, embedding)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    """,
+                    batch_data,
+                )
+                total_processed += len(batch_data)
+                logger.debug("Inserted batch of %s code examples", len(batch_data))
+
+            logger.info(
+                "Successfully inserted %s code examples into database", total_processed
+            )
+        except Exception as e:
+            logger.error("Error during code examples insertion: %s", e)
+            raise
 
 async def update_source_info(pool: asyncpg.Pool, source_id: str, summary: str, word_count: int) -> None:
     """
@@ -848,33 +846,35 @@ async def cleanup_old_data(days: int = 30) -> int:
     pool = await get_db_pool()
     
     async with pool.acquire() as connection, connection.transaction():
-        # Delete old crawled pages
-        result1 = await connection.execute("""
+        # Delete old crawled pages and count affected rows
+        crawled_pages_result = await connection.fetch("""
             DELETE FROM crawled_pages 
             WHERE created_at < NOW() - INTERVAL '%s days'
+            RETURNING id
         """, days)
+        crawled_pages_count = len(crawled_pages_result)
         
-        # Delete old code examples  
-        result2 = await connection.execute("""
+        # Delete old code examples and count affected rows
+        code_examples_result = await connection.fetch("""
             DELETE FROM code_examples 
             WHERE created_at < NOW() - INTERVAL '%s days'
+            RETURNING id
         """, days)
+        code_examples_count = len(code_examples_result)
         
-        # Delete orphaned sources
-        result3 = await connection.execute("""
+        # Delete orphaned sources and count affected rows
+        sources_result = await connection.fetch("""
             DELETE FROM sources 
             WHERE source_id NOT IN (
                 SELECT DISTINCT source_id FROM crawled_pages
                 UNION
                 SELECT DISTINCT source_id FROM code_examples
             )
+            RETURNING source_id
         """)
+        sources_count = len(sources_result)
         
-        deleted_count = (
-            int(result1.split()[-1]) + 
-            int(result2.split()[-1]) + 
-            int(result3.split()[-1])
-        )
+        deleted_count = crawled_pages_count + code_examples_count + sources_count
         
-        logging.info(f"Cleaned up {deleted_count} old records")
+        logging.info(f"Cleaned up {deleted_count} old records (crawled_pages: {crawled_pages_count}, code_examples: {code_examples_count}, sources: {sources_count})")
         return deleted_count

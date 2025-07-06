@@ -431,7 +431,7 @@ The Neo4j database stores code structure as:
 For production deployments:
 - Always use Docker secrets for credentials
 - Configure proper network security policies
-- Implement API rate limiting
+- Implement API rate-limiting
 - Regular security scanning and updates
 - Monitor logs for suspicious activity
 
