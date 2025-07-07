@@ -8,48 +8,7 @@ and tool registration will be added in subsequent iterations.
 """
 
 import os
-from contextlib import asynccontextmanager
-from collections.abc import AsyncIterator
-
-from fastmcp import FastMCP  # type: ignore
-
-###############################################################################
-# Lifespan – initialise heavy resources here (browser pools, DB pools, etc.).
-# For now we keep it empty; concrete init/teardown will be added later.
-###############################################################################
-
-
-@asynccontextmanager
-async def lifespan(server: FastMCP) -> AsyncIterator[None]:
-    """Placeholder async lifespan context manager.
-
-    FastMCP will call this once on startup and once on shutdown.  Populate with
-    real initialisation (e.g. AsyncWebCrawler, asyncpg pool) in later stages.
-    """
-
-    # --- PROVISIONING PLACEHOLDER -----------------------------------------
-    # Insert initialisation logic here in future commits, e.g.:
-    #   crawler = AsyncWebCrawler(...)
-    #   await crawler.__aenter__()
-    #   server.state["crawler"] = crawler
-    # ----------------------------------------------------------------------
-    try:
-        yield
-    finally:
-        # Perform graceful teardown of resources when they are added.
-        pass
-
-
-###############################################################################
-# FastMCP server definition.
-###############################################################################
-
-mcp = FastMCP(
-    name="crawl4rag-mcp",
-    description="Modern, self-hostable RAG stack powered by Crawl4AI and pgvector.",
-    lifespan=lifespan,
-)
-
+from crawl4rag_mcp.server import mcp
 
 ###############################################################################
 # Bootstrap – run with streamable-http transport.
