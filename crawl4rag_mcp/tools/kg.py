@@ -78,7 +78,9 @@ async def parse_github_repository_tool(ctx: Context, repo_url: str) -> str:  # n
     if not all(creds.values()):
         return json.dumps({"success": False, "error": "Neo4j credentials missing"})
 
-    extractor = DirectNeo4jExtractor(  # type: ignore[arg-type]
+    # At this point mypy/pylance cannot know the class is imported; assert for type checker.
+    assert DirectNeo4jExtractor is not None  # for typing
+    extractor = DirectNeo4jExtractor(  # type: ignore[arg-type,call-arg]
         cast(str, creds["uri"]), cast(str, creds["user"]), cast(str, creds["password"])
     )
     await extractor.initialize()
@@ -104,9 +106,10 @@ async def check_ai_script_hallucinations_tool(ctx: Context, script_path: str) ->
     if not all(creds.values()):
         return json.dumps({"success": False, "error": "Neo4j credentials missing"})
 
-    # validator
-    validator = KnowledgeGraphValidator(  # type: ignore
-        creds["uri"], creds["user"], creds["password"]
+    # At this point mypy/pylance cannot know the class is imported; assert for type checker.
+    assert KnowledgeGraphValidator is not None  # type: ignore[assert-type]
+    validator = KnowledgeGraphValidator(  # type: ignore[arg-type,call-arg]
+        cast(str, creds["uri"]), cast(str, creds["user"]), cast(str, creds["password"])
     )
     await validator.initialize()
     analyzer = AIScriptAnalyzer()
@@ -135,7 +138,9 @@ async def query_knowledge_graph_tool(ctx: Context, command: str) -> str:  # noqa
     if not all(creds.values()):
         return json.dumps({"success": False, "error": "Neo4j credentials missing"})
 
-    extractor = DirectNeo4jExtractor(  # type: ignore[arg-type]
+    # At this point mypy/pylance cannot know the class is imported; assert for type checker.
+    assert DirectNeo4jExtractor is not None
+    extractor = DirectNeo4jExtractor(  # type: ignore[arg-type,call-arg]
         cast(str, creds["uri"]), cast(str, creds["user"]), cast(str, creds["password"])
     )
     await extractor.initialize()
